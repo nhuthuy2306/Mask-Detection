@@ -398,7 +398,7 @@ def associate_and_stabilize(detections, now):
             second_score = ranked[1][1] if len(ranked) > 1 else 0.0
             average_confidence = winner_score / max(1, counts[winner])
             confident_majority = (
-                len(observations) >= 3
+                len(observations) >= 2
                 and winner_score / max(total_score, 1e-6) >= 0.62
                 and (winner_score - second_score) / max(total_score, 1e-6) >= 0.18
                 and average_confidence >= 0.50
@@ -407,7 +407,7 @@ def associate_and_stabilize(detections, now):
                 best_track["candidate_label"] = winner
                 best_track["candidate_since"] = now
             if (confident_majority and winner == best_track["candidate_label"]
-                    and now - best_track["candidate_since"] >= 1.0):
+                    and now - best_track["candidate_since"] >= 0.4):
                 best_track["stable_label"] = winner
                 best_track["stable_confidence"] = average_confidence
             elif confident_majority and best_track["stable_label"] == winner:
@@ -415,7 +415,7 @@ def associate_and_stabilize(detections, now):
 
         label_is_stable = (
             best_track["candidate_label"] is not None
-            and now - best_track["candidate_since"] >= 1.0
+            and now - best_track["candidate_since"] >= 0.4
             and best_track["stable_label"] == best_track["candidate_label"]
         )
         class_is_fresh = now - best_track["last_class_seen"] <= 3.0
