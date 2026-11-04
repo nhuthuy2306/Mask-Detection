@@ -1,59 +1,91 @@
-# Webcam mask detection: Flask + ONNX
+# Hệ thống nhận diện khẩu trang qua webcam
 
-The Flask server receives webcam frames from the browser and runs the mask detector with ONNX Runtime. It writes detection and latency records to PostgreSQL/Supabase; uploading images to AWS S3 is optional.
+Ứng dụng dùng webcam trong trình duyệt để nhận diện trạng thái khẩu trang. Trình duyệt gửi từng khung hình đến Flask; server chạy model bằng **ONNX Runtime**, trả về nhãn, độ tin cậy và tọa độ khung. Các sự kiện nhận diện ổn định và số liệu độ trễ được lưu vào PostgreSQL/Supabase. Lưu ảnh lên AWS S3 là tùy chọn.
 
-## Export the model in Google Colab
+## Luồng hoạt động
 
-1. Open `colab_export_onnx.ipynb` in Google Colab.
-2. Run the cells and upload `mask_model.pt` when prompted. PyTorch and Ultralytics are used in Colab only to convert the checkpoint.
-3. Download the resulting `mask_model.onnx` and place it beside `app_web.py` (or set `MODEL_PATH` to its location).
+1. Người dùng mở trang bằng HTTPS và cấp quyền webcam.
+2. Trình duyệt chụp và gửi ảnh JPEG đến `POST /api/detect`.
+3. Flask tiền xử lý ảnh, chạy `mask_model.onnx` và trả về kết quả nhận diện.
+4. Giao diện vẽ khung và nhãn lên video.
+5. Khi trạng thái được xác nhận ổn định và thay đổi, ứng dụng ghi log vào PostgreSQL/Supabase.
 
-The exported model uses a fixed 640×640 input to reduce memory use and retains the three classes in this order: `wrong mask`, `mask`, `no mask`.
+Các lớp của model là `wrong mask`, `mask`, `no mask`. Model hiện dùng các khung nhận diện làm đề xuất khuôn mặt; project chưa cài một face detector riêng.
 
-## Run the Flask app
+## Model và dữ liệu huấn luyện
+
+- `mask_model.pt`: checkpoint dùng để export hoặc huấn luyện tiếp.
+- `mask_model.onnx`: model dùng khi chạy Flask; inference không cần PyTorch.
+- `export_onnx.py` và `colab_export_onnx.ipynb`: công cụ export model trên Google Colab.
+- `requirements-export.txt`: thư viện chỉ cần cho bước export.
+
+> Repo không chứa dataset, file cấu hình huấn luyện hoặc lịch sử train. Vì vậy cần kiểm tra nguồn dữ liệu, cách gán nhãn, số lượng ảnh, cách chia train/validation/test và chỉ số đánh giá từ nhóm trước khi báo cáo các thông tin đó.
+
+Model ONNX hiện có trong repo nhận đầu vào **960×960**. Notebook và script export mặc định dùng **640×640** để giảm tính toán và bộ nhớ; sau khi export, cần thay `mask_model.onnx` trong repo rồi deploy lại để áp dụng.
+
+## Export ONNX trên Google Colab
+
+1. Mở `colab_export_onnx.ipynb` bằng Google Colab.
+2. Chạy các cell và tải `mask_model.pt` lên khi notebook yêu cầu.
+3. Notebook export `mask_model.onnx` với kích thước 640×640 và tải file về.
+4. Thay `mask_model.onnx` trong project bằng file vừa tải.
+
+PyTorch/Ultralytics chỉ dùng cho bước export. Server Flask chỉ dùng ONNX Runtime.
+
+Có thể export bằng dòng lệnh trong môi trường đã cài `requirements-export.txt`:
+
+```bash
+python export_onnx.py mask_model.pt --imgsz 640
+```
+
+## Cài đặt và chạy ứng dụng
 
 ```bash
 pip install -r requirements.txt
 python app_web.py
 ```
 
-Set `DATABASE_URL` and `HTML_TEMPLATE` in the environment. Set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, and `AWS_S3_BUCKET_NAME` only if image uploads to S3 are needed. Do not commit credentials. The app loads `mask_model.onnx` by default; `MODEL_PATH` can override it.
+Tạo `.env` cục bộ với `DATABASE_URL` trỏ đến PostgreSQL/Supabase. Có thể đặt thêm `HTML_TEMPLATE` (ví dụ `index_chat.html`) và `MODEL_PATH` nếu model không ở đường dẫn mặc định `mask_model.onnx`.
 
-For deployment from Colab, upload the project files and `mask_model.onnx` to the Colab runtime, install `requirements.txt`, set the environment variables in the notebook, and run `python app_web.py`. Use a secure HTTPS tunnel so the laptop browser can access the webcam page; Colab sessions and their public tunnel URLs are temporary. Keep database and AWS credentials in Colab secrets or enter them at runtime, never in a notebook committed to the repository.
+Để lưu ảnh nhận diện lên S3, cấu hình `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` và `AWS_S3_BUCKET_NAME`. Nếu không cấu hình bucket, ứng dụng không khởi tạo AWS SDK.
 
-## Persistent HTTPS deployment with Google Cloud Run
+**Không commit `.env` hoặc giá trị bí mật lên GitHub.** Dùng biến môi trường/Secrets trên dịch vụ hosting.
 
-Colab is temporary. For a stable HTTPS URL that remains available after the Colab session ends, deploy the Flask app to Cloud Run. The service can scale to zero when idle, so the first request after an idle period may take longer. Keeping an instance warm can incur charges. Cloud Run has a monthly free tier, with usage billed beyond that tier.
+## Deploy trên Render
 
-Before deploying, put `mask_model.onnx` in this project directory and make sure `templates/` and `requirements.txt` are present. Do not include `.env`; the Docker build excludes it. Create a Secret Manager secret named `DATABASE_URL` with the PostgreSQL connection string, and grant the Cloud Run service identity permission to access that secret.
+Repository được deploy dưới dạng Flask web service. Cấu hình các biến môi trường/Secrets trên Render, tối thiểu cần `DATABASE_URL`; đặt `HTML_TEMPLATE` và `MODEL_PATH` nếu cần.
 
-With Google Cloud CLI installed and authenticated, deploy from this directory:
-
-```bash
-gcloud config set project YOUR_GCP_PROJECT_ID
-gcloud run deploy mask-detection \
-  --source . \
-  --region asia-southeast1 \
-  --allow-unauthenticated \
-  --memory 2Gi \
-  --cpu 2 \
-  --timeout 120 \
-  --set-env-vars HTML_TEMPLATE=index_chat.html,MODEL_PATH=/app/mask_model.onnx \
-  --set-secrets DATABASE_URL=DATABASE_URL:latest
-```
-
-Cloud Run prints the stable HTTPS service URL after deployment. If S3 uploads are enabled, add the AWS values through Cloud Run's environment and secrets settings; do not put secret values in the command or source files.
-
-To repeat the checkpoint conversion outside the notebook, install `requirements-export.txt` in a conversion environment and run:
+Lệnh chạy Gunicorn dùng trên Render:
 
 ```bash
-python export_onnx.py mask_model.pt --imgsz 640
+gunicorn --workers 1 --threads 2 --timeout 120 --bind 0.0.0.0:$PORT app_web:app
 ```
 
-## Latency measurements
+Render Free có giới hạn CPU/RAM; model 960×960 có thể inference chậm hoặc dùng nhiều bộ nhớ. Export lại model 640×640 giúp giảm tải, nhưng tốc độ còn phụ thuộc cấu hình dịch vụ.
 
-- Inference: `T_infer_end - T_infer_start`, measured around ONNX Runtime inference in Flask.
-- RTT: `T_response_received - T_request_sent`, measured around the browser frame request.
-- End to end: `T_result_rendered - T_frame_captured`.
+## Lưu trữ dữ liệu
 
-The dashboard keeps the latest 50 webcam samples. `GET /api/latency` returns samples from `latency_samples`; `POST /api/latency/record` stores measurements and updates the related detection log. Run `python migrate_latency.py` once to add latency columns to an existing database; the app creates `latency_samples` on startup.
+- **GitHub:** mã nguồn và model artifact; không lưu `.env`.
+- **Render:** chạy Flask và ONNX Runtime.
+- **PostgreSQL/Supabase:** lưu bảng `detection_logs` và `latency_samples`.
+- **AWS S3 (tùy chọn):** lưu ảnh sự kiện nhận diện khi đã cấu hình bucket.
+
+Ứng dụng chỉ ghi log sau khi trạng thái được xác nhận ổn định. ID track là số thứ tự trong database, không phải định danh sinh trắc học.
+
+## Công thức độ trễ
+
+Tất cả số đo tính bằng mili giây (ms):
+
+- **Inference latency:** thời gian Flask chạy `predict_onnx()`, gồm tiền xử lý, ONNX Runtime và NMS.
+
+  `T_infer = t_infer_end - t_infer_start`
+
+- **RTT:** thời gian từ lúc trình duyệt gửi request đến lúc nhận response; gồm truyền dữ liệu lên/xuống và xử lý phía server.
+
+  `T_RTT = t_response_received - t_request_sent`
+
+- **Total latency hiện tại:** thời gian từ lúc chụp frame đến lúc nhận response; gồm mã hóa ảnh, RTT và xử lý request. Phép đo hiện dừng ở lúc nhận response, chưa tính thời điểm khung được vẽ xong.
+
+  `T_total = t_response_received - t_frame_captured`
+
+Dashboard giữ tối đa 50 mẫu độ trễ gần nhất. `GET /api/latency` đọc mẫu; `POST /api/latency/record` lưu số đo liên quan đến log nhận diện. Với database cũ, chạy `python migrate_latency.py` một lần để thêm các cột độ trễ cần thiết.
