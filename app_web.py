@@ -27,7 +27,12 @@ app.logger.setLevel(logging.INFO)
 app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 
 # --- CẤU HÌNH SUPABASE (POSTGRESQL) ---
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
+database_url = os.getenv("DATABASE_URL")
+if database_url and database_url.startswith("postgresql+psycopg://"):
+    database_url = database_url.replace(
+        "postgresql+psycopg://", "postgresql+psycopg2://", 1
+    )
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {"poolclass": NullPool}
 
