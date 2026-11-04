@@ -705,8 +705,7 @@
         let currentLogsPage = 0;
         const LOGS_PER_PAGE = 5;
         const INFERENCE_INTERVAL_MS = 160;
-        const MAX_RESULT_AGE_MS = 650;
-        const TRACK_FADE_MS = 550;
+        const TRACK_FADE_MS = 3000;
         const BOX_TRANSITION_MS = 160;
 
         async function connectCamera() {
@@ -943,9 +942,7 @@
                 showLiveMetric("roundtrip", latencySamples.roundtrip, roundtrip);
                 showLiveMetric("total", latencySamples.total, frameAge);
 
-                if (frameAge <= MAX_RESULT_AGE_MS) {
-                    updateOverlayTracks(result.detections, capture.width, capture.height, responseReceivedAt);
-                }
+                updateOverlayTracks(result.detections, capture.width, capture.height, responseReceivedAt);
 
                 const logIds = Array.isArray(result.log_ids)
                     ? result.log_ids
