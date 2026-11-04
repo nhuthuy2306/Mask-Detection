@@ -911,7 +911,7 @@
 
             inferenceBusy = true;
             const capture = document.createElement("canvas");
-            const scale = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
+            const scale = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
             capture.width = Math.round(video.videoWidth * scale);
             capture.height = Math.round(video.videoHeight * scale);
             const captureContext = capture.getContext("2d");

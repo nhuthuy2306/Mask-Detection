@@ -1,0 +1,4 @@
+# Google Colab only: conversion requires PyTorch and Ultralytics.
+ultralytics>=8.0.0
+onnx>=1.14.0
+onnxsim>=0.4.0

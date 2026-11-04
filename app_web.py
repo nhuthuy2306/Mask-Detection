@@ -1,4 +1,5 @@
 import os
+import ast
 import math
 import cv2
 import time
@@ -6,10 +7,9 @@ import uuid
 import threading
 import logging
 import pytz
-import boto3
 from datetime import datetime
 from dotenv import load_dotenv
-from ultralytics import YOLO
+import onnxruntime as ort
 from flask import Flask, render_template, jsonify, request, make_response
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import inspect, text
@@ -78,7 +78,24 @@ class LatencySample(db.Model):
     total_latency_ms = db.Column(db.Float, nullable=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(VN_TZ).replace(tzinfo=None), nullable=False)
 
-model = YOLO("mask_model.pt")
+MODEL_PATH = os.getenv("MODEL_PATH", "mask_model.onnx")
+session_options = ort.SessionOptions()
+session_options.intra_op_num_threads = 1
+session_options.inter_op_num_threads = 1
+session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+model = ort.InferenceSession(
+    MODEL_PATH,
+    sess_options=session_options,
+    providers=["CPUExecutionProvider"],
+)
+model_input = model.get_inputs()[0]
+MODEL_SIZE = int(model_input.shape[2]) if isinstance(model_input.shape[2], int) else 960
+metadata_names = model.get_modelmeta().custom_metadata_map.get("names")
+if metadata_names:
+    parsed_names = ast.literal_eval(metadata_names)
+    CLASS_NAMES = [name for _, name in sorted((int(key), value) for key, value in parsed_names.items())] if isinstance(parsed_names, dict) else list(parsed_names)
+else:
+    CLASS_NAMES = ["wrong mask", "mask", "no mask"]
 MODEL_CLASS_ALIASES = {
     "incorrectly worn mask": "wrong mask",
     "wrong mask": "wrong mask",
@@ -87,13 +104,13 @@ MODEL_CLASS_ALIASES = {
     "without mask": "no mask",
     "no mask": "no mask",
 }
-_model_names = model.names.items() if isinstance(model.names, dict) else enumerate(model.names)
+_model_names = enumerate(CLASS_NAMES)
 classNames = {
     int(class_id): MODEL_CLASS_ALIASES.get(str(name).lower().replace("_", " ").strip(), "Unknown")
     for class_id, name in _model_names
 }
 if set(classNames.values()) != {"wrong mask", "mask", "no mask"}:
-    raise ValueError(f"Unexpected mask_model.pt class metadata: {model.names}")
+    raise ValueError(f"Unexpected ONNX class metadata: {CLASS_NAMES}")
 app.logger.info("Loaded mask model class mapping: %s", classNames)
 app.logger.warning(
     "No standalone face detector is installed; repeated mask_model.pt boxes are used as face proposals."
@@ -105,20 +122,70 @@ colors = [
     (0, 0, 255)      # Đỏ cho "Không đeo" (no mask)
 ]
 
+
+def predict_onnx(frame, conf_threshold=0.12, iou_threshold=0.50, max_det=100):
+    """Run YOLOv8 ONNX detection and return xyxy, class, confidence tuples."""
+    import numpy as np
+
+    height, width = frame.shape[:2]
+    scale = min(MODEL_SIZE / width, MODEL_SIZE / height)
+    resized_w, resized_h = int(round(width * scale)), int(round(height * scale))
+    resized = cv2.resize(frame, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+    pad_x, pad_y = (MODEL_SIZE - resized_w) // 2, (MODEL_SIZE - resized_h) // 2
+    canvas = np.full((MODEL_SIZE, MODEL_SIZE, 3), 114, dtype=np.uint8)
+    canvas[pad_y:pad_y + resized_h, pad_x:pad_x + resized_w] = resized
+    tensor = canvas[:, :, ::-1].transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+    output = model.run(None, {model_input.name: tensor})[0]
+    predictions = np.squeeze(output)
+    if predictions.ndim != 2:
+        return []
+    # YOLOv8 detection exports are (channels, candidates); tolerate transposed exports.
+    if predictions.shape[0] < predictions.shape[1]:
+        predictions = predictions.T
+    if predictions.shape[1] != 4 + len(CLASS_NAMES):
+        raise ValueError(f"Unexpected ONNX output shape: {output.shape}")
+    boxes_xywh = predictions[:, :4]
+    class_scores = predictions[:, 4:]
+    class_ids = np.argmax(class_scores, axis=1)
+    scores = class_scores[np.arange(len(class_ids)), class_ids]
+    selected = scores >= conf_threshold
+    boxes_xywh, class_ids, scores = boxes_xywh[selected], class_ids[selected], scores[selected]
+    if not len(scores):
+        return []
+    xyxy = np.empty_like(boxes_xywh)
+    xyxy[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2
+    xyxy[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2
+    xyxy[:, 2] = boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2
+    xyxy[:, 3] = boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2
+    xyxy[:, [0, 2]] = (xyxy[:, [0, 2]] - pad_x) / scale
+    xyxy[:, [1, 3]] = (xyxy[:, [1, 3]] - pad_y) / scale
+    xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clip(0, width)
+    xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clip(0, height)
+    nms_boxes = [[int(x), int(y), int(w), int(h)] for x, y, w, h in
+                 zip(xyxy[:, 0], xyxy[:, 1], xyxy[:, 2] - xyxy[:, 0], xyxy[:, 3] - xyxy[:, 1])]
+    indices = cv2.dnn.NMSBoxes(nms_boxes, scores.tolist(), conf_threshold, iou_threshold)
+    return [(xyxy[i].astype(int).tolist(), int(class_ids[i]), float(scores[i]))
+            for i in list(indices.flatten())[:max_det]]
+
 # --- CẤU HÌNH AWS S3 ---
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-    region_name=os.getenv('AWS_REGION')
-)
 BUCKET_NAME = os.getenv('AWS_S3_BUCKET_NAME')
 AWS_REGION = os.getenv('AWS_REGION')
+s3_client = None
+if BUCKET_NAME:
+    import boto3
+
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+        region_name=AWS_REGION,
+    )
 
 
 browser_tracks = {}
 next_browser_track_id = 1
 next_confirmed_track_id = 1
+last_logged_status = None
 
 
 def box_iou(box_a, box_b):
@@ -260,7 +327,7 @@ def associate_and_stabilize(detections, now):
             best_track["last_class_seen"] = now
             best_track["observations"].append((now, detection["label"], detection["confidence"]))
         best_track["observations"] = [
-            item for item in best_track["observations"] if now - item[0] <= 1.6
+            item for item in best_track["observations"] if now - item[0] <= 5.0
         ]
 
         observations = best_track["observations"]
@@ -268,7 +335,7 @@ def associate_and_stabilize(detections, now):
             scores = {}
             counts = {}
             for observed_at, label, confidence in observations:
-                recency_weight = 0.75 + 0.25 * max(0, 1 - (now - observed_at) / 1.6)
+                recency_weight = 0.75 + 0.25 * max(0, 1 - (now - observed_at) / 5.0)
                 scores[label] = scores.get(label, 0.0) + confidence * recency_weight
                 counts[label] = counts.get(label, 0) + 1
             ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
@@ -297,7 +364,7 @@ def associate_and_stabilize(detections, now):
             and now - best_track["candidate_since"] >= 1.0
             and best_track["stable_label"] == best_track["candidate_label"]
         )
-        class_is_fresh = now - best_track["last_class_seen"] <= 1.0
+        class_is_fresh = now - best_track["last_class_seen"] <= 3.0
         classification_is_stable = label_is_stable and class_is_fresh
         if classification_is_stable and best_track["display_id"] is None:
             best_track["display_id"] = next_confirmed_track_id
@@ -326,7 +393,8 @@ def associate_and_stabilize(detections, now):
         # One event per track state: first stable label, then only a different
         # stable label. The saved label is advanced only after the DB commit.
         if (classification_is_stable
-                and best_track["logged_label"] != best_track["stable_label"]):
+                and best_track["logged_label"] != best_track["stable_label"]
+                and best_track["stable_label"] != last_logged_status):
             log_candidates.append((output, best_track))
 
     for track_id in list(browser_tracks):
@@ -341,6 +409,15 @@ with app.app_context():
         # Add the nullable column for existing databases without dropping old logs.
         with db.engine.begin() as connection:
             connection.execute(text("ALTER TABLE detection_logs ADD COLUMN track_id INTEGER"))
+    highest_track_id = db.session.query(db.func.max(DetectionLog.track_id)).scalar() or 0
+    next_confirmed_track_id = highest_track_id + 1
+    latest_log = DetectionLog.query.order_by(DetectionLog.id.desc()).first()
+    if latest_log:
+        last_logged_status = {
+            "mask": "mask",
+            "no_mask": "no mask",
+            "wrong_mask": "wrong mask",
+        }.get(latest_log.status)
 
 
 def upload_detection_image_async(log_id, object_name, image_bytes):
@@ -373,6 +450,7 @@ def index():
 @app.route('/api/detect', methods=['POST'])
 def detect_frame():
     """Run mask detection on the latest laptop webcam frame."""
+    global last_logged_status
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
         return jsonify({"error": "Body must be a JSON object"}), 400
@@ -394,25 +472,20 @@ def detect_frame():
     request_started = time.perf_counter()
     frame_height, frame_width = frame.shape[:2]
     infer_started = time.perf_counter()
-    results = model.predict(
-        frame, imgsz=960, conf=0.12, iou=0.50, max_det=100, verbose=False
-    )
+    results = predict_onnx(frame, conf_threshold=0.12, iou_threshold=0.50, max_det=100)
     inference_ms = (time.perf_counter() - infer_started) * 1000
 
     raw_detections = []
-    for result in results:
-        for box in result.boxes:
-            class_id = int(box.cls[0])
-            label = classNames.get(class_id, "Unknown")
-            if label == "Unknown":
-                continue
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            raw_detections.append({
-                "box": [x1, y1, x2, y2],
-                "label": label,
-                "class_id": class_id,
-                "confidence": float(box.conf[0]),
-            })
+    for box, class_id, confidence in results:
+        label = classNames.get(class_id, "Unknown")
+        if label == "Unknown":
+            continue
+        raw_detections.append({
+            "box": box,
+            "label": label,
+            "class_id": class_id,
+            "confidence": confidence,
+        })
 
     # The checkpoint has only mask-state classes, so its boxes serve as face proposals.
     deduplicated = suppress_duplicate_boxes(raw_detections)
@@ -452,6 +525,7 @@ def detect_frame():
 
                 for entry, detection, track, canonical_status in entries:
                     track["logged_label"] = track["stable_label"]
+                    last_logged_status = track["stable_label"]
                     detection["log_id"] = entry.id
                     log_ids.append(entry.id)
                     app.logger.info(
@@ -590,14 +664,14 @@ def get_latency_stats():
 
 @app.route('/api/logs/clear', methods=['GET', 'POST'])
 def clear_logs():
-    global browser_tracks, next_browser_track_id, next_confirmed_track_id
+    global browser_tracks, next_browser_track_id, last_logged_status
     browser_tracks = {}
     next_browser_track_id = 1
-    next_confirmed_track_id = 1
     try:
         db.session.query(LatencySample).delete()
         num_rows_deleted = db.session.query(DetectionLog).delete()
         db.session.commit()
+        last_logged_status = None
         return jsonify({"status": "success", "message": f"Đã xóa {num_rows_deleted} record trong DB"})
     except Exception as e:
         db.session.rollback()
