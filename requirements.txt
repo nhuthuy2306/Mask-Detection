@@ -9,3 +9,4 @@ pytz
 
 Flask-SQLAlchemy 
 psycopg2-binary
+psycopg[binary]>=3.2
