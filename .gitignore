@@ -1,0 +1,45 @@
+# =====================================
+# Python & Virtual Environment
+# =====================================
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# =====================================
+# Environment Variables & Secrets
+# =====================================
+# BẢO MẬT: Không bao giờ commit file chứa AWS keys, Telegram Token, Database URL
+.env
+.env.*
+!.env.example
+
+# =====================================
+# YOLO & Ultralytics
+# =====================================
+runs/
+*.log
+# Model weights tải tự động (YOLOv8 nano gốc)
+yolov8n.pt
+
+# (Tùy chọn: bỏ comment dòng dưới nếu không muốn push model custom lên Git)
+# mask_model.pt
+
+# =====================================
+# IDE & Code Editors
+# =====================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =====================================
+# Operating System
+# =====================================
+.DS_Store
+Thumbs.db

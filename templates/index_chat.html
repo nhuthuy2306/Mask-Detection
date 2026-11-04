@@ -1,0 +1,1403 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Laptop AI Mask Detection</title>
+
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        navy: "#0b1120",
+                        panel: "#111827",
+                        panel2: "#172033",
+                        primary: "#3b82f6"
+                    },
+                    boxShadow: {
+                        glow: "0 0 30px rgba(59,130,246,0.15)"
+                    }
+                }
+            }
+        };
+    </script>
+
+    <style>
+        body {
+            background:
+                radial-gradient(
+                    circle at 10% 10%,
+                    rgba(59, 130, 246, 0.10),
+                    transparent 30%
+                ),
+                radial-gradient(
+                    circle at 90% 20%,
+                    rgba(16, 185, 129, 0.07),
+                    transparent 30%
+                ),
+                #070b14;
+        }
+
+        .glass {
+            background: rgba(17, 24, 39, 0.75);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.07);
+        }
+
+        .live-dot {
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%,
+            100% {
+                opacity: 1;
+                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5);
+            }
+
+            50% {
+                opacity: 0.7;
+                box-shadow: 0 0 0 7px rgba(239, 68, 68, 0);
+            }
+        }
+
+        .camera-grid {
+            background-image:
+                linear-gradient(
+                    rgba(255, 255, 255, 0.025) 1px,
+                    transparent 1px
+                ),
+                linear-gradient(
+                    90deg,
+                    rgba(255, 255, 255, 0.025) 1px,
+                    transparent 1px
+                );
+            background-size: 40px 40px;
+        }
+
+        .scrollbar::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        .scrollbar::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .scrollbar::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 10px;
+        }
+
+        .scan-line {
+            position: absolute;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: rgba(59, 130, 246, 0.35);
+            animation: scan 4s linear infinite;
+            pointer-events: none;
+        }
+
+        @keyframes scan {
+            0% {
+                top: 0%;
+            }
+
+            100% {
+                top: 100%;
+            }
+        }
+    </style>
+</head>
+
+<body class="min-h-screen text-white">
+
+    <div class="max-w-[1500px] mx-auto px-5 py-6 lg:px-8">
+
+        <!-- Header -->
+        <header class="flex flex-col md:flex-row md:items-center justify-between gap-5 mb-8">
+
+            <div class="flex items-center gap-4">
+
+                <div
+                    class="w-12 h-12 rounded-2xl bg-blue-500/10 border border-blue-400/20 flex items-center justify-center shadow-glow"
+                >
+                    <svg
+                        class="w-6 h-6 text-blue-400"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.8"
+                        viewBox="0 0 24 24"
+                    >
+                        <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
+                        />
+                    </svg>
+                </div>
+
+                <div>
+                    <h1 class="text-2xl font-bold tracking-tight">
+                        AI Mask Detection
+                    </h1>
+
+                    <p class="text-sm text-slate-400">
+                        Laptop Webcam Monitoring System
+                    </p>
+                </div>
+
+            </div>
+
+            <div class="flex items-center gap-3">
+
+                <div class="glass rounded-full px-4 py-2 flex items-center gap-2">
+
+                    <span
+                        id="system-dot"
+                        class="w-2 h-2 rounded-full bg-slate-500"
+                    ></span>
+
+                    <span
+                        id="system-status"
+                        class="text-sm text-slate-300"
+                    >
+                        Disconnected
+                    </span>
+
+                </div>
+
+                <div class="hidden sm:block text-xs text-slate-500">
+                    Laptop Webcam ? AI Vision
+                </div>
+
+            </div>
+
+        </header>
+
+        <!-- Latency Dashboard -->
+        <section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+
+            <!-- a) Cloud Inference Time -->
+            <div class="glass rounded-2xl p-5 border-l-4 border-blue-500/60">
+                <div class="flex items-center justify-between mb-3">
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-slate-500">a) Thời gian suy luận trên server</p>
+                        <p class="text-[11px] text-slate-600 mt-0.5">T_infer_end &minus; T_infer_start</p>
+                    </div>
+                    <div class="w-9 h-9 rounded-lg bg-blue-500/10 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"/>
+                        </svg>
+                    </div>
+                </div>
+                <div class="flex items-end gap-2">
+                    <span id="lat-inference-avg" class="text-2xl font-bold text-blue-400">--</span>
+                    <span class="text-sm text-slate-500 mb-0.5">ms avg</span>
+                </div>
+                <div class="flex gap-3 mt-2 text-xs text-slate-600">
+                    <span>Min: <span id="lat-inference-min" class="text-slate-400">--</span>ms</span>
+                    <span>Max: <span id="lat-inference-max" class="text-slate-400">--</span>ms</span>
+                </div>
+            </div>
+
+            <!-- b) Roundtrip Local <-> Cloud -->
+            <div class="glass rounded-2xl p-5 border-l-4 border-purple-500/60">
+                <div class="flex items-center justify-between mb-3">
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-slate-500">b) Local &harr; Cloud RTT</p>
+                        <p class="text-[11px] text-slate-600 mt-0.5">T_response_received &minus; T_request_sent</p>
+                    </div>
+                    <div class="w-9 h-9 rounded-lg bg-purple-500/10 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7 16V4m0 0L3 8m4-4l4 4M17 8v12m0 0l4-4m-4 4l-4-4"/>
+                        </svg>
+                    </div>
+                </div>
+                <div class="flex items-end gap-2">
+                    <span id="lat-roundtrip-avg" class="text-2xl font-bold text-purple-400">--</span>
+                    <span class="text-sm text-slate-500 mb-0.5">ms avg</span>
+                </div>
+                <div class="flex gap-3 mt-2 text-xs text-slate-600">
+                    <span>Min: <span id="lat-roundtrip-min" class="text-slate-400">--</span>ms</span>
+                    <span>Max: <span id="lat-roundtrip-max" class="text-slate-400">--</span>ms</span>
+                </div>
+            </div>
+
+            <!-- c) Total End-to-End Latency -->
+            <div class="glass rounded-2xl p-5 border-l-4 border-amber-500/60">
+                <div class="flex items-center justify-between mb-3">
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-slate-500">c) Độ trễ người dùng chờ</p>
+                        <p class="text-[11px] text-slate-600 mt-0.5">T_result_ready &minus; T_frame_capture</p>
+                    </div>
+                    <div class="w-9 h-9 rounded-lg bg-amber-500/10 flex items-center justify-center">
+                        <svg class="w-4 h-4 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                    </div>
+                </div>
+                <div class="flex items-end gap-2">
+                    <span id="lat-total-avg" class="text-2xl font-bold text-amber-400">--</span>
+                    <span class="text-sm text-slate-500 mb-0.5">ms avg</span>
+                </div>
+                <div class="flex gap-3 mt-2 text-xs text-slate-600">
+                    <span>Min: <span id="lat-total-min" class="text-slate-400">--</span>ms</span>
+                    <span>Max: <span id="lat-total-max" class="text-slate-400">--</span>ms</span>
+                </div>
+            </div>
+
+        </section>
+
+        <!-- Statistics -->
+        <section class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+
+            <!-- Camera -->
+            <div class="glass rounded-2xl p-5 shadow-glow">
+
+                <div class="flex items-center justify-between">
+
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-slate-500">
+                            Camera
+                        </p>
+
+                        <p
+                            id="camera-stat"
+                            class="text-xl font-semibold mt-2"
+                        >
+                            Offline
+                        </p>
+                    </div>
+
+                    <div
+                        class="w-10 h-10 rounded-xl bg-blue-500/10 flex items-center justify-center"
+                    >
+                        <svg
+                            class="w-5 h-5 text-blue-400"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="1.8"
+                                d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
+                            />
+                        </svg>
+                    </div>
+
+                </div>
+
+            </div>
+
+            <!-- Detections -->
+            <div class="glass rounded-2xl p-5">
+
+                <div class="flex items-center justify-between">
+
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-slate-500">
+                            Detections
+                        </p>
+
+                        <p
+                            id="total-detections"
+                            class="text-xl font-semibold mt-2"
+                        >
+                            0
+                        </p>
+                    </div>
+
+                    <div
+                        class="w-10 h-10 rounded-xl bg-purple-500/10 flex items-center justify-center"
+                    >
+                        <svg
+                            class="w-5 h-5 text-purple-400"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="1.8"
+                                d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                            />
+                        </svg>
+                    </div>
+
+                </div>
+
+            </div>
+
+            <!-- Mask -->
+            <div class="glass rounded-2xl p-5">
+
+                <div class="flex items-center justify-between">
+
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-slate-500">
+                            With Mask
+                        </p>
+
+                        <p
+                            id="mask-count"
+                            class="text-xl font-semibold text-emerald-400 mt-2"
+                        >
+                            0
+                        </p>
+                    </div>
+
+                    <div
+                        class="w-10 h-10 rounded-xl bg-emerald-500/10 flex items-center justify-center"
+                    >
+                        <svg
+                            class="w-5 h-5 text-emerald-400"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="1.8"
+                                d="M5 13l4 4L19 7"
+                            />
+                        </svg>
+                    </div>
+
+                </div>
+
+            </div>
+
+            <!-- Warnings -->
+            <div class="glass rounded-2xl p-5">
+
+                <div class="flex items-center justify-between">
+
+                    <div>
+                        <p class="text-xs uppercase tracking-wider text-slate-500">
+                            Warnings
+                        </p>
+
+                        <p
+                            id="warning-count"
+                            class="text-xl font-semibold text-amber-400 mt-2"
+                        >
+                            0
+                        </p>
+                    </div>
+
+                    <div
+                        class="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center"
+                    >
+                        <svg
+                            class="w-5 h-5 text-amber-400"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="1.8"
+                                d="M12 9v2m0 4h.01M10.29 3.86l-7.82 14a1 1 0 00.87 1.5h17.32a1 1 0 00.87-1.5l-7.82-14a1 1 0 00-1.74 0z"
+                            />
+                        </svg>
+                    </div>
+
+                </div>
+
+            </div>
+
+        </section>
+
+        <!-- Main -->
+        <main class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+
+            <!-- Camera -->
+            <section class="xl:col-span-2 glass rounded-2xl p-5 shadow-glow">
+
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-5">
+
+                    <div>
+
+                        <div class="flex items-center gap-3">
+
+                            <h2 class="font-semibold text-lg">
+                                Live Camera
+                            </h2>
+
+                            <span
+                                id="live-badge"
+                                class="hidden items-center gap-2 px-2.5 py-1 rounded-full bg-red-500/10 border border-red-500/20 text-red-400 text-xs font-semibold"
+                            >
+                                <span
+                                    class="live-dot w-1.5 h-1.5 rounded-full bg-red-500"
+                                ></span>
+
+                                LIVE
+                            </span>
+
+                        </div>
+
+                        <p class="text-sm text-slate-500 mt-1">
+                            Webcam laptop · nhận diện khẩu trang trực tiếp
+                        </p>
+
+                    </div>
+
+                    <button
+                        onclick="toggleFullscreen()"
+                        class="self-start sm:self-auto px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 transition"
+                    >
+                        <svg
+                            class="w-4 h-4"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="1.8"
+                                d="M8 3H5a2 2 0 00-2 2v3m18 0V5a2 2 0 00-2-2h-3m0 18h3a2 2 0 002-2v-3M3 16v3a2 2 0 002 2h3"
+                            />
+                        </svg>
+                    </button>
+
+                </div>
+
+                <!-- Camera container -->
+                <div
+                    id="camera-container"
+                    class="camera-grid relative bg-black rounded-2xl overflow-hidden aspect-video border border-white/10 flex items-center justify-center"
+                >
+
+                    <!-- Placeholder -->
+                    <div
+                        id="placeholder-text"
+                        class="text-center px-6"
+                    >
+
+                        <div
+                            class="w-16 h-16 mx-auto mb-4 rounded-2xl bg-white/5 flex items-center justify-center"
+                        >
+                            <svg
+                                class="w-8 h-8 text-slate-600"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                            >
+                                <path
+                                    stroke-linecap="round"
+                                    stroke-linejoin="round"
+                                    stroke-width="1.5"
+                                    d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
+                                />
+                            </svg>
+                        </div>
+
+                        <p class="text-slate-400 font-medium">
+                            Camera is not connected
+                        </p>
+
+                        <p class="text-slate-600 text-sm mt-1">
+                            Nhấn “Bật webcam laptop” để bắt đầu
+                        </p>
+
+                    </div>
+
+                    <!-- Video -->
+                    <video id="video-stream" autoplay muted playsinline
+                        class="w-full h-full object-contain hidden relative z-10"
+                        style="transform: scaleX(-1)"></video>
+                    <canvas id="detection-canvas" class="absolute inset-0 w-full h-full object-contain hidden z-20 pointer-events-none"></canvas>
+
+                    <!-- Scan effect -->
+                    <div
+                        id="scan-line"
+                        class="scan-line hidden z-20"
+                    ></div>
+
+                    <!-- Camera overlay -->
+                    <div
+                        id="camera-overlay"
+                        class="hidden absolute z-30 top-4 left-4 right-4 justify-between pointer-events-none"
+                    >
+
+                        <div class="px-3 py-1.5 rounded-lg bg-black/60 backdrop-blur-md text-xs text-white">Webcam laptop → Flask/Cloud</div>
+
+                        <div
+                            id="camera-ip-label"
+                            class="px-3 py-1.5 rounded-lg bg-black/60 backdrop-blur-md text-xs text-slate-300"
+                        >
+                            --
+                        </div>
+
+                    </div>
+
+                </div>
+
+                <!-- Camera endpoint -->
+                <div class="mt-5">
+
+                    <label class="text-xs uppercase tracking-wider text-slate-500 mb-2 block">Camera laptop</label>
+
+                    <div class="flex flex-col sm:flex-row gap-3">
+
+                        <button
+                            onclick="connectCamera()"
+                            id="connect-button"
+                            class="px-6 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 active:scale-[0.98] font-medium text-sm transition shadow-lg shadow-blue-600/20"
+                        >
+                            <span id="connect-text">
+                                Bật webcam laptop
+                            </span>
+                        </button>
+
+                    </div>
+
+                </div>
+
+            </section>
+
+            <!-- Detection Logs -->
+            <section class="glass rounded-2xl p-5 flex flex-col min-h-[600px]">
+
+                <div class="flex items-center justify-between mb-5">
+
+                    <div>
+                        <h2 class="font-semibold text-lg">
+                            Detection Logs
+                        </h2>
+
+                        <p class="text-sm text-slate-500 mt-1">
+                            Latest AI detections
+                        </p>
+                    </div>
+
+                    <div
+                        class="w-9 h-9 rounded-lg bg-white/5 flex items-center justify-center"
+                    >
+                        <svg
+                            class="w-4 h-4 text-slate-400"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="1.8"
+                                d="M12 8v4l3 2m6-2a9 9 0 11-18 0 9 9 0 0118 0z"
+                            />
+                        </svg>
+                    </div>
+
+                </div>
+
+                <div
+                    id="log-container"
+                    class="scrollbar overflow-y-auto flex-1 min-h-0 space-y-2 pr-1"
+                >
+                    <div
+                        class="h-full flex flex-col items-center justify-center text-center"
+                    >
+                        <div
+                            class="w-12 h-12 rounded-xl bg-white/5 flex items-center justify-center mb-3"
+                        >
+                            <svg
+                                class="w-6 h-6 text-slate-600"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                            >
+                                <path
+                                    stroke-linecap="round"
+                                    stroke-linejoin="round"
+                                    stroke-width="1.5"
+                                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                                />
+                            </svg>
+                        </div>
+
+                        <p class="text-sm text-slate-500">
+                            No detections yet
+                        </p>
+                    </div>
+                </div>
+
+                <div class="pt-3 flex items-center justify-between gap-2">
+                    <button
+                        id="logs-prev-button"
+                        type="button"
+                        onclick="changeLogsPage(-1)"
+                        class="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs text-slate-300 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                        Trước
+                    </button>
+                    <span id="logs-page-label" class="text-xs text-slate-500 text-center">
+                        Trang 1 / 1
+                    </span>
+                    <button
+                        id="logs-next-button"
+                        type="button"
+                        onclick="changeLogsPage(1)"
+                        class="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-xs text-slate-300 hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                        Sau
+                    </button>
+                </div>
+
+                <div
+                    class="pt-4 mt-4 border-t border-white/5 flex justify-between text-xs text-slate-500"
+                >
+                    <span>
+                        Auto refresh
+                    </span>
+
+                    <span class="flex items-center gap-1.5">
+                        <span
+                            class="w-1.5 h-1.5 rounded-full bg-emerald-400"
+                        ></span>
+                        1 second
+                    </span>
+                </div>
+
+            </section>
+
+        </main>
+
+        <!-- Footer -->
+        <footer
+            class="mt-8 flex flex-col sm:flex-row justify-between gap-2 text-xs text-slate-600"
+        >
+            <span>
+                Laptop AI Mask Monitoring System
+            </span>
+
+            <span>
+                Powered by Computer Vision ? Laptop Webcam
+            </span>
+        </footer>
+
+    </div>
+
+    <script>
+        let connected = false;
+        let cameraStream = null;
+        let inferenceTimer = null;
+        let renderFrameId = null;
+        let inferenceController = null;
+        let inferenceBusy = false;
+        let cameraSession = 0;
+        let overlayTracks = [];
+        let nextTrackId = 1;
+        let latencySamples = { infer: [], roundtrip: [], total: [] };
+        let currentLogs = [];
+        let currentLogsPage = 0;
+        const LOGS_PER_PAGE = 5;
+        const INFERENCE_INTERVAL_MS = 160;
+        const MAX_RESULT_AGE_MS = 650;
+        const TRACK_FADE_MS = 550;
+        const BOX_TRANSITION_MS = 160;
+
+        async function connectCamera() {
+            const video = document.getElementById("video-stream");
+            const canvas = document.getElementById("detection-canvas");
+            const button = document.getElementById("connect-button");
+            if (cameraStream) {
+                cameraSession++;
+                clearInterval(inferenceTimer);
+                cancelAnimationFrame(renderFrameId);
+                inferenceController?.abort();
+                inferenceTimer = null;
+                renderFrameId = null;
+                inferenceBusy = false;
+                overlayTracks = [];
+                cameraStream.getTracks().forEach(track => track.stop());
+                cameraStream = null;
+                video.classList.add("hidden");
+                canvas.classList.add("hidden");
+                canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+                document.getElementById("placeholder-text").classList.remove("hidden");
+                button.disabled = false;
+                setCameraConnected(false);
+                return;
+            }
+            if (!navigator.mediaDevices?.getUserMedia) {
+                alert("Webcam cần HTTPS hoặc localhost. Hãy mở ứng dụng qua localhost hoặc bật HTTPS khi triển khai cloud.");
+                return;
+            }
+            button.disabled = true;
+            document.getElementById("connect-text").innerText = "Đang mở webcam...";
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+                });
+                video.srcObject = cameraStream;
+                await video.play();
+                document.getElementById("placeholder-text").classList.add("hidden");
+                video.classList.remove("hidden");
+                canvas.classList.remove("hidden");
+                document.getElementById("camera-ip-label").innerText = "Webcam laptop";
+                setCameraConnected(true);
+                button.disabled = false;
+                document.getElementById("connect-text").innerText = "Tắt webcam";
+                cameraSession++;
+                startDetection(cameraSession);
+            } catch (error) {
+                cameraStream = null;
+                button.disabled = false;
+                document.getElementById("connect-text").innerText = "Bật webcam laptop";
+                alert(`Không mở được webcam: ${error.message}`);
+                setCameraConnected(false);
+            }
+        }
+
+        function showLiveMetric(prefix, samples, value) {
+            samples.push(value);
+            if (samples.length > 50) samples.shift();
+            const stem = prefix === "infer" ? "inference" : prefix === "roundtrip" ? "roundtrip" : "total";
+            document.getElementById(`lat-${stem}-avg`).innerText = (samples.reduce((a, b) => a + b, 0) / samples.length).toFixed(1);
+            document.getElementById(`lat-${stem}-min`).innerText = Math.min(...samples).toFixed(1);
+            document.getElementById(`lat-${stem}-max`).innerText = Math.max(...samples).toFixed(1);
+        }
+
+        function startDetection(sessionId) {
+            renderDetectionOverlay(sessionId);
+            inferLatestFrame(sessionId);
+            inferenceTimer = setInterval(() => {
+                if (!inferenceBusy) inferLatestFrame(sessionId);
+            }, INFERENCE_INTERVAL_MS);
+        }
+
+        function currentTrackBox(track, now) {
+            const progress = Math.min(1, (now - track.transitionStarted) / BOX_TRANSITION_MS);
+            const eased = 1 - Math.pow(1 - progress, 3);
+            return track.fromBox.map((value, index) =>
+                value + (track.targetBox[index] - value) * eased
+            );
+        }
+
+        function updateOverlayTracks(detections, frameWidth, frameHeight, now) {
+            const unmatched = new Set(overlayTracks.map(track => track.id));
+            const ordered = [...detections].sort((a, b) => b.confidence - a.confidence);
+
+            for (const detection of ordered) {
+                const box = detection.box;
+                const centerX = (box[0] + box[2]) / 2;
+                const centerY = (box[1] + box[3]) / 2;
+                const maxDistance = Math.max(55, Math.hypot(box[2] - box[0], box[3] - box[1]) * 0.8);
+                let match = null;
+                let bestDistance = maxDistance;
+                const trackingId = detection.tracking_id ?? detection.track_id;
+
+                for (const track of overlayTracks) {
+                    if (!unmatched.has(track.id)) continue;
+                    if (trackingId != null
+                            ? track.trackIdentity !== trackingId
+                            : track.label !== detection.label) continue;
+                    const previous = currentTrackBox(track, now);
+                    const dx = centerX - (previous[0] + previous[2]) / 2;
+                    const dy = centerY - (previous[1] + previous[3]) / 2;
+                    const distance = Math.hypot(dx, dy);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        match = track;
+                    }
+                }
+
+                if (match) {
+                    match.fromBox = currentTrackBox(match, now);
+                    match.targetBox = box;
+                    match.transitionStarted = now;
+                    match.lastSeen = now;
+                    match.label = detection.label;
+                    match.labelStable = detection.label_stable === true;
+                    match.trackIdentity = trackingId;
+                    match.trackId = detection.track_id;
+                    match.confidence = detection.confidence;
+                    match.frameWidth = frameWidth;
+                    match.frameHeight = frameHeight;
+                    unmatched.delete(match.id);
+                } else {
+                    overlayTracks.push({
+                        id: nextTrackId++, label: detection.label,
+                        labelStable: detection.label_stable === true,
+                        trackIdentity: trackingId,
+                        trackId: detection.track_id,
+                        fromBox: box, targetBox: box, transitionStarted: now,
+                        lastSeen: now, confidence: detection.confidence,
+                        frameWidth, frameHeight
+                    });
+                }
+            }
+        }
+
+        function renderDetectionOverlay(sessionId) {
+            if (!cameraStream || sessionId !== cameraSession) return;
+            const canvas = document.getElementById("detection-canvas");
+            const container = document.getElementById("camera-container");
+            const width = container.clientWidth;
+            const height = container.clientHeight;
+            if (canvas.width !== width || canvas.height !== height) {
+                canvas.width = width;
+                canvas.height = height;
+            }
+
+            const ctx = canvas.getContext("2d");
+            const now = performance.now();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            overlayTracks = overlayTracks.filter(track => now - track.lastSeen <= TRACK_FADE_MS);
+
+            for (const track of overlayTracks) {
+                const age = now - track.lastSeen;
+                const alpha = age < 250 ? 1 : Math.max(0, 1 - (age - 250) / (TRACK_FADE_MS - 250));
+                const fit = Math.min(canvas.width / track.frameWidth, canvas.height / track.frameHeight);
+                const offsetX = (canvas.width - track.frameWidth * fit) / 2;
+                const offsetY = (canvas.height - track.frameHeight * fit) / 2;
+                const [x1, y1, x2, y2] = currentTrackBox(track, now);
+                const left = offsetX + x1 * fit;
+                const top = offsetY + y1 * fit;
+                const boxWidth = (x2 - x1) * fit;
+                const boxHeight = (y2 - y1) * fit;
+                const normalizedLabel = String(track.label || "").toLowerCase().replaceAll("_", " ");
+                const color = normalizedLabel === "mask" ? "#22c55e"
+                    : normalizedLabel === "wrong mask" ? "#facc15"
+                    : normalizedLabel === "no mask" ? "#ef4444" : "#60a5fa";
+                const displayLabel = normalizedLabel === "no mask" ? "NO MASK"
+                    : normalizedLabel === "wrong mask" ? "WRONG MASK"
+                    : normalizedLabel === "mask" ? "MASK" : "ĐANG PHÂN LOẠI";
+                const confidenceText = `${(track.confidence * 100).toFixed(0)}%`;
+                const idPrefix = track.trackId == null ? "" : `ID ${track.trackId} · `;
+                const confirmationText = track.trackId == null
+                    ? " · CHỜ XÁC NHẬN"
+                    : track.labelStable ? "" : " · XÁC NHẬN";
+                const badgeText = `${idPrefix}${displayLabel} · ${confidenceText}${confirmationText}`;
+
+                ctx.globalAlpha = alpha;
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 3;
+                ctx.strokeRect(left, top, boxWidth, boxHeight);
+                ctx.font = "bold 14px sans-serif";
+                const badgePaddingX = 8;
+                const badgeHeight = 25;
+                const badgeWidth = ctx.measureText(badgeText).width + badgePaddingX * 2;
+                const badgeLeft = Math.max(0, Math.min(left, canvas.width - badgeWidth));
+                const badgeTop = top >= badgeHeight + 4 ? top - badgeHeight - 4 : Math.min(canvas.height - badgeHeight, top + 4);
+                ctx.fillStyle = color;
+                ctx.fillRect(badgeLeft, badgeTop, badgeWidth, badgeHeight);
+                ctx.fillStyle = "#07111f";
+                ctx.textBaseline = "middle";
+                ctx.fillText(badgeText, badgeLeft + badgePaddingX, badgeTop + badgeHeight / 2);
+            }
+            ctx.textBaseline = "alphabetic";
+            ctx.globalAlpha = 1;
+            renderFrameId = requestAnimationFrame(() => renderDetectionOverlay(sessionId));
+        }
+
+        async function inferLatestFrame(sessionId) {
+            if (!cameraStream || sessionId !== cameraSession || inferenceBusy) return;
+            const video = document.getElementById("video-stream");
+            if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) return;
+
+            inferenceBusy = true;
+            const capture = document.createElement("canvas");
+            const scale = Math.min(1, 960 / Math.max(video.videoWidth, video.videoHeight));
+            capture.width = Math.round(video.videoWidth * scale);
+            capture.height = Math.round(video.videoHeight * scale);
+            const captureContext = capture.getContext("2d");
+            captureContext.save();
+            captureContext.translate(capture.width, 0);
+            captureContext.scale(-1, 1);
+            captureContext.drawImage(video, 0, 0, capture.width, capture.height);
+            captureContext.restore();
+            const frameCapturedAt = performance.now();
+            const image = capture.toDataURL("image/jpeg", 0.65);
+            const requestSentAt = performance.now();
+            const controller = new AbortController();
+            inferenceController = controller;
+
+            try {
+                const response = await fetch("/api/detect", {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ image }), signal: controller.signal
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const result = await response.json();
+                if (sessionId !== cameraSession) return;
+                if (result.cloud_error) console.warn(result.cloud_error);
+
+                const responseReceivedAt = performance.now();
+                const frameAge = responseReceivedAt - frameCapturedAt;
+                const roundtrip = responseReceivedAt - requestSentAt;
+                showLiveMetric("infer", latencySamples.infer, result.inference_time_ms);
+                showLiveMetric("roundtrip", latencySamples.roundtrip, roundtrip);
+                showLiveMetric("total", latencySamples.total, frameAge);
+
+                if (frameAge <= MAX_RESULT_AGE_MS) {
+                    updateOverlayTracks(result.detections, capture.width, capture.height, responseReceivedAt);
+                }
+
+                const logIds = Array.isArray(result.log_ids)
+                    ? result.log_ids
+                    : (result.log_id ? [result.log_id] : []);
+                if (logIds.length) {
+                    fetchLogs();
+                    for (const logId of logIds) {
+                        fetch("/api/latency/record", {
+                            method: "POST", headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ log_id: logId,
+                                roundtrip_time_ms: roundtrip, total_latency_ms: frameAge })
+                        }).catch(error => console.error("Could not save latency sample:", error));
+                    }
+                }
+            } catch (error) {
+                if (error.name !== "AbortError") {
+                    console.error("Frame inference failed:", error);
+                    setCameraConnected(false);
+                }
+            } finally {
+                if (sessionId === cameraSession) {
+                    inferenceBusy = false;
+                    inferenceController = null;
+                }
+            }
+        }
+
+        // Camera status
+        function setCameraConnected(status) {
+            connected = status;
+
+            const dot =
+                document.getElementById("system-dot");
+
+            const systemStatus =
+                document.getElementById("system-status");
+
+            const cameraStat =
+                document.getElementById("camera-stat");
+
+            const liveBadge =
+                document.getElementById("live-badge");
+
+            const scanLine =
+                document.getElementById("scan-line");
+
+            const overlay =
+                document.getElementById("camera-overlay");
+
+            const connectText =
+                document.getElementById("connect-text");
+
+            const button =
+                document.getElementById("connect-button");
+
+            if (status) {
+                dot.className =
+                    "w-2 h-2 rounded-full bg-emerald-400";
+
+                systemStatus.innerText =
+                    "System Online";
+
+                systemStatus.className =
+                    "text-sm text-emerald-400";
+
+                cameraStat.innerText =
+                    "Online";
+
+                cameraStat.className =
+                    "text-xl font-semibold mt-2 text-emerald-400";
+
+                liveBadge.classList.remove("hidden");
+                liveBadge.classList.add("flex");
+
+                scanLine.classList.remove("hidden");
+
+                overlay.classList.remove("hidden");
+                overlay.classList.add("flex");
+
+                connectText.innerText =
+                    "Reconnect";
+            } else {
+                dot.className =
+                    "w-2 h-2 rounded-full bg-slate-500";
+
+                systemStatus.innerText =
+                    "Disconnected";
+
+                systemStatus.className =
+                    "text-sm text-slate-300";
+
+                cameraStat.innerText =
+                    "Offline";
+
+                cameraStat.className =
+                    "text-xl font-semibold mt-2";
+
+                liveBadge.classList.add("hidden");
+
+                scanLine.classList.add("hidden");
+
+                overlay.classList.add("hidden");
+                overlay.classList.remove("flex");
+
+                connectText.innerText = "Bật webcam laptop";
+            }
+
+            button.disabled = false;
+            button.classList.remove("opacity-70");
+        }
+
+        // Status color
+        function getStatusInfo(status) {
+            const s = (status || "")
+                .toLowerCase()
+                .trim();
+
+            if (
+                s === "no mask" ||
+                s === "no_mask" ||
+                s === "without_mask" ||
+                s.includes("no mask") ||
+                s.includes("khong") ||
+                s.includes("without")
+            ) {
+                return {
+                    label: status,
+                    icon: `
+                        <svg
+                            class="w-4 h-4"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="2"
+                                d="M6 18L18 6M6 6l12 12"
+                            />
+                        </svg>
+                    `,
+                    classes:
+                        "bg-red-500/10 text-red-400 border-red-500/20",
+                    type: "warning"
+                };
+            }
+
+            if (
+                s === "wrong mask" ||
+                s === "wrong_mask" ||
+                s === "incorrectly_worn_mask" ||
+                s.includes("sai") ||
+                s.includes("wrong")
+            ) {
+                return {
+                    label: status,
+                    icon: `
+                        <svg
+                            class="w-4 h-4"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="2"
+                                d="M12 9v4m0 4h.01M10.29 3.86l-7.82 14a1 1 0 00.87 1.5h17.32a1 1 0 00.87-1.5l-7.82-14a1 1 0 00-1.74 0z"
+                            />
+                        </svg>
+                    `,
+                    classes:
+                        "bg-amber-500/10 text-amber-400 border-amber-500/20",
+                    type: "warning"
+                };
+            }
+
+            if (
+                s === "mask" ||
+                s === "with_mask" ||
+                s.includes("dung") ||
+                (s.includes("mask") &&
+                    !s.includes("wrong") &&
+                    !s.includes("incorrect") &&
+                    !s.includes("no"))
+            ) {
+                return {
+                    label: status,
+                    icon: `
+                        <svg
+                            class="w-4 h-4"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                        >
+                            <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                stroke-width="2"
+                                d="M5 13l4 4L19 7"
+                            />
+                        </svg>
+                    `,
+                    classes:
+                        "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+                    type: "mask"
+                };
+            }
+
+            return {
+                label: status,
+                icon: `
+                    <svg
+                        class="w-4 h-4"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                    >
+                        <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            stroke-width="2"
+                            d="M6 18L18 6M6 6l12 12"
+                        />
+                    </svg>
+                `,
+                classes:
+                    "bg-red-500/10 text-red-400 border-red-500/20",
+                type: "warning"
+            };
+        }
+
+        // Parse confidence
+        function parseConfidence(value) {
+            if (value === null || value === undefined) {
+                return 0;
+            }
+
+            let number = parseFloat(
+                String(value).replace("%", "")
+            );
+
+            if (number <= 1) {
+                number *= 100;
+            }
+
+            return Math.max(
+                0,
+                Math.min(100, number)
+            );
+        }
+
+        // Escape HTML
+        function escapeHtml(value) {
+            return String(value ?? "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // Render paginated detection results.
+        function changeLogsPage(direction) {
+            const pageCount = Math.max(1, Math.ceil(currentLogs.length / LOGS_PER_PAGE));
+            currentLogsPage = Math.max(0, Math.min(pageCount - 1, currentLogsPage + direction));
+            renderLogs(currentLogs);
+        }
+
+        function updateLogsPagination(startIndex, endIndex, pageCount) {
+            const previousButton = document.getElementById("logs-prev-button");
+            const nextButton = document.getElementById("logs-next-button");
+            const pageLabel = document.getElementById("logs-page-label");
+            previousButton.disabled = currentLogsPage <= 0;
+            nextButton.disabled = currentLogsPage >= pageCount - 1;
+            pageLabel.innerText = currentLogs.length
+                ? `Trang ${currentLogsPage + 1} / ${pageCount} · ${startIndex + 1}-${endIndex} / ${currentLogs.length}`
+                : "Trang 1 / 1 · 0 kết quả";
+        }
+
+        function renderLogs(logs) {
+            if (Array.isArray(logs)) currentLogs = logs;
+            const container = document.getElementById("log-container");
+            const pageCount = Math.max(1, Math.ceil(currentLogs.length / LOGS_PER_PAGE));
+            currentLogsPage = Math.min(currentLogsPage, pageCount - 1);
+            const startIndex = currentLogsPage * LOGS_PER_PAGE;
+            const pageLogs = currentLogs.slice(startIndex, startIndex + LOGS_PER_PAGE);
+            updateLogsPagination(startIndex, startIndex + pageLogs.length, pageCount);
+
+            if (currentLogs.length === 0) {
+                container.innerHTML = `
+                    <div class="h-full flex flex-col items-center justify-center text-center">
+                        <div class="w-12 h-12 rounded-xl bg-white/5 flex items-center justify-center mb-3">
+                            <svg class="w-6 h-6 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                            </svg>
+                        </div>
+                        <p class="text-sm text-slate-500">No detections yet</p>
+                    </div>`;
+                updateStatistics(currentLogs);
+                return;
+            }
+
+            container.innerHTML = "";
+            pageLogs.forEach(log => {
+                const info = getStatusInfo(log.status);
+                const confidence = parseConfidence(log.confidence);
+                const trackBadge = log.track_id != null && Number.isFinite(Number(log.track_id))
+                    ? `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-white/5 text-slate-400">ID ${escapeHtml(log.track_id)}</span>`
+                    : "";
+                const logEl = document.createElement("div");
+                logEl.className = `group p-3 rounded-xl border ${info.classes} transition hover:bg-white/[0.04]`;
+                logEl.innerHTML = `
+                    <div class="flex items-center gap-3">
+                        <div class="w-9 h-9 rounded-lg bg-black/10 flex items-center justify-center shrink-0">${info.icon}</div>
+                        <div class="flex-1 min-w-0">
+                            <div class="flex items-center justify-between gap-2">
+                                <div class="flex items-center gap-2 min-w-0">
+                                    <span class="font-medium text-sm truncate">${escapeHtml(info.label)}</span>
+                                    ${trackBadge}
+                                </div>
+                                <span class="text-xs text-slate-500 shrink-0">${escapeHtml(log.time || "--:--:--")}</span>
+                            </div>
+                            <div class="flex items-center gap-2 mt-2">
+                                <div class="flex-1 h-1.5 bg-black/20 rounded-full overflow-hidden">
+                                    <div class="h-full rounded-full bg-current transition-all" style="width: ${confidence}%"></div>
+                                </div>
+                                <span class="text-xs font-semibold min-w-[40px] text-right">${confidence.toFixed(1)}%</span>
+                            </div>
+                        </div>
+                    </div>`;
+                container.appendChild(logEl);
+            });
+            updateStatistics(currentLogs);
+        }
+
+        // Statistics
+        function updateStatistics(logs) {
+            const total = logs.length;
+
+            let mask = 0;
+            let warning = 0;
+
+            logs.forEach(log => {
+                const type =
+                    getStatusInfo(log.status).type;
+
+                if (type === "mask") {
+                    mask++;
+                } else {
+                    warning++;
+                }
+            });
+
+            document.getElementById("total-detections").innerText =
+                total;
+
+            document.getElementById("mask-count").innerText =
+                mask;
+
+            document.getElementById("warning-count").innerText =
+                warning;
+        }
+
+        // Fetch logs
+        async function fetchLogs() {
+            try {
+                const response =
+                    await fetch("/api/logs");
+
+                if (!response.ok) {
+                    throw new Error(
+                        `HTTP ${response.status}`
+                    );
+                }
+
+                const logs =
+                    await response.json();
+
+                renderLogs(logs);
+            } catch (error) {
+                console.error(
+                    "Error fetching logs:",
+                    error
+                );
+            }
+        }
+
+        // Fullscreen
+        function toggleFullscreen() {
+            const camera =
+                document.getElementById("camera-container");
+
+            if (!document.fullscreenElement) {
+                camera.requestFullscreen()
+                    .catch(error => {
+                        console.error(
+                            "Fullscreen error:",
+                            error
+                        );
+                    });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+
+        // Fetch latency stats
+        async function fetchLatency() {
+            try {
+                const res = await fetch("/api/latency");
+                if (!res.ok) return;
+                const data = await res.json();
+
+                function set(id, val) {
+                    const el = document.getElementById(id);
+                    if (el) el.innerText = val !== null && val !== undefined ? val : "--";
+                }
+
+                const infer = data.inference_time_ms;
+                if (latencySamples.infer.length === 0) {
+                    set("lat-inference-avg", infer.avg);
+                    set("lat-inference-min", infer.min);
+                    set("lat-inference-max", infer.max);
+                }
+
+                const rt = data.roundtrip_time_ms;
+                if (latencySamples.roundtrip.length === 0) {
+                    set("lat-roundtrip-avg", rt.avg);
+                    set("lat-roundtrip-min", rt.min);
+                    set("lat-roundtrip-max", rt.max);
+                }
+
+                const tot = data.total_latency_ms;
+                if (latencySamples.total.length === 0) {
+                    set("lat-total-avg", tot.avg);
+                    set("lat-total-min", tot.min);
+                    set("lat-total-max", tot.max);
+                }
+            } catch (e) {
+                console.error("Error fetching latency:", e);
+            }
+        }
+
+        // Start
+        fetchLogs();
+        fetchLatency();
+
+        setInterval(fetchLogs, 1000);
+        setInterval(fetchLatency, 5000);
+    </script>
+
+</body>
+</html>
