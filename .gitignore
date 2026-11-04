@@ -43,3 +43,4 @@ yolov8n.pt
 # =====================================
 .DS_Store
 Thumbs.db
+markDetection

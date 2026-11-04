@@ -7,6 +7,7 @@ import threading
 import logging
 import pytz
 import boto3
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from ultralytics import YOLO
@@ -78,7 +79,45 @@ class LatencySample(db.Model):
     total_latency_ms = db.Column(db.Float, nullable=False)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(VN_TZ).replace(tzinfo=None), nullable=False)
 
-model = YOLO("mask_model.pt")
+# --- CẤU HÌNH AWS S3 ---
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('AWS_REGION')
+)
+BUCKET_NAME = os.getenv('AWS_S3_BUCKET_NAME')
+AWS_REGION = os.getenv('AWS_REGION')
+
+# --- CẤU HÌNH CLOUD MODEL SERVER (Nếu chạy theo mô hình Local Web <-> Cloud Model) ---
+MODEL_SERVER_URL = os.getenv("MODEL_SERVER_URL")
+
+# --- NẠP MÔ HÌNH YOLO (Tự động tải từ S3 nếu chưa có ở Cloud server) ---
+MODEL_PATH = os.getenv("MODEL_PATH", "mask_model.pt")
+S3_MODEL_KEY = os.getenv("S3_MODEL_KEY", "models/mask_model.pt")
+
+model = None
+if not MODEL_SERVER_URL or os.path.exists(MODEL_PATH):
+    if not os.path.exists(MODEL_PATH):
+        if BUCKET_NAME and s3_client:
+            app.logger.info("Chưa có file model tại local. Đang tải từ S3: s3://%s/%s ...", BUCKET_NAME, S3_MODEL_KEY)
+            try:
+                s3_client.download_file(BUCKET_NAME, S3_MODEL_KEY, MODEL_PATH)
+                app.logger.info("Đã tải thành công %s từ S3!", MODEL_PATH)
+            except Exception as exc:
+                app.logger.error("Không thể tải model từ S3: %s", exc)
+                if not MODEL_SERVER_URL:
+                    raise
+        else:
+            if not MODEL_SERVER_URL:
+                raise FileNotFoundError(f"Không tìm thấy file model {MODEL_PATH} và S3 chưa cấu hình.")
+
+    if os.path.exists(MODEL_PATH):
+        model = YOLO(MODEL_PATH)
+        app.logger.info("Đã nạp model YOLO thành công từ %s", MODEL_PATH)
+
+if MODEL_SERVER_URL:
+    app.logger.info("Sử dụng Cloud AI Model Server tại: %s", MODEL_SERVER_URL)
 MODEL_CLASS_ALIASES = {
     "incorrectly worn mask": "wrong mask",
     "wrong mask": "wrong mask",
@@ -87,14 +126,18 @@ MODEL_CLASS_ALIASES = {
     "without mask": "no mask",
     "no mask": "no mask",
 }
-_model_names = model.names.items() if isinstance(model.names, dict) else enumerate(model.names)
-classNames = {
-    int(class_id): MODEL_CLASS_ALIASES.get(str(name).lower().replace("_", " ").strip(), "Unknown")
-    for class_id, name in _model_names
-}
-if set(classNames.values()) != {"wrong mask", "mask", "no mask"}:
-    raise ValueError(f"Unexpected mask_model.pt class metadata: {model.names}")
-app.logger.info("Loaded mask model class mapping: %s", classNames)
+if model is not None:
+    _model_names = model.names.items() if isinstance(model.names, dict) else enumerate(model.names)
+    classNames = {
+        int(class_id): MODEL_CLASS_ALIASES.get(str(name).lower().replace("_", " ").strip(), "Unknown")
+        for class_id, name in _model_names
+    }
+    if set(classNames.values()) != {"wrong mask", "mask", "no mask"}:
+        raise ValueError(f"Unexpected mask_model.pt class metadata: {model.names}")
+    app.logger.info("Loaded mask model class mapping: %s", classNames)
+else:
+    classNames = {0: "wrong mask", 1: "mask", 2: "no mask"}
+    app.logger.info("Default mask model class mapping: %s", classNames)
 app.logger.warning(
     "No standalone face detector is installed; repeated mask_model.pt boxes are used as face proposals."
 )
@@ -105,15 +148,9 @@ colors = [
     (0, 0, 255)      # Đỏ cho "Không đeo" (no mask)
 ]
 
-# --- CẤU HÌNH AWS S3 ---
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-    region_name=os.getenv('AWS_REGION')
-)
-BUCKET_NAME = os.getenv('AWS_S3_BUCKET_NAME')
-AWS_REGION = os.getenv('AWS_REGION')
+# --- CẤU HÌNH TELEGRAM BOT ---
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 
 browser_tracks = {}
@@ -361,6 +398,55 @@ def upload_detection_image_async(log_id, object_name, image_bytes):
     threading.Thread(target=upload_task, daemon=True).start()
 
 
+def send_telegram_alert_async(status, confidence, image_bytes, track_id=None):
+    """Gửi cảnh báo và hình ảnh tới Telegram Bot bất đồng bộ."""
+    def telegram_task():
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            app.logger.debug("Telegram alert skipped: Chưa cấu hình TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID")
+            return
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        current_time_str = datetime.now(VN_TZ).strftime("%d/%m/%Y %H:%M:%S")
+
+        status_mapping = {
+            "mask": "Đeo khẩu trang đúng quy định (Mask) ✅",
+            "no_mask": "KHÔNG đeo khẩu trang (No Mask) 🚨",
+            "wrong_mask": "Đeo khẩu trang SAI cách (Wrong Mask) ⚠️",
+        }
+        status_text = status_mapping.get(status, status)
+        track_str = f"\n👤 <b>Track ID:</b> #{track_id}" if track_id is not None else ""
+
+        caption = (
+            f"🚨 <b>CẢNH BÁO NHẬN DIỆN KHẨU TRANG</b> 🚨\n"
+            f"⏱ <b>Thời gian:</b> {current_time_str}\n"
+            f"⚠️ <b>Trạng thái:</b> {status_text}\n"
+            f"📊 <b>Độ tin cậy:</b> {confidence}"
+            f"{track_str}"
+        )
+
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+        files = {
+            "photo": ("alert.jpg", image_bytes, "image/jpeg"),
+        }
+
+        try:
+            t_start = time.perf_counter()
+            response = requests.post(url, data=payload, files=files, timeout=10)
+            latency_ms = (time.perf_counter() - t_start) * 1000
+            if response.status_code == 200:
+                app.logger.info("--> [Telegram] Đã gửi thông báo cảnh báo thành công! (Trễ: %.1fms)", latency_ms)
+            else:
+                app.logger.warning("--> [Telegram] Lỗi gửi tin nhắn: %s", response.text)
+        except Exception as exc:
+            app.logger.warning("--> [Telegram] Lỗi kết nối API: %s", exc)
+
+    threading.Thread(target=telegram_task, daemon=True).start()
+
+
 @app.route('/')
 def index():
     response = make_response(render_template(HTML_TEMPLATE))
@@ -393,26 +479,52 @@ def detect_frame():
 
     request_started = time.perf_counter()
     frame_height, frame_width = frame.shape[:2]
-    infer_started = time.perf_counter()
-    results = model.predict(
-        frame, imgsz=960, conf=0.12, iou=0.50, max_det=100, verbose=False
-    )
-    inference_ms = (time.perf_counter() - infer_started) * 1000
 
-    raw_detections = []
-    for result in results:
-        for box in result.boxes:
-            class_id = int(box.cls[0])
-            label = classNames.get(class_id, "Unknown")
-            if label == "Unknown":
-                continue
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            raw_detections.append({
-                "box": [x1, y1, x2, y2],
-                "label": label,
-                "class_id": class_id,
-                "confidence": float(box.conf[0]),
-            })
+    cloud_rtt_ms = None
+    if MODEL_SERVER_URL:
+        # Gửi frame ảnh lên Cloud Server (EC2) để chạy YOLO
+        try:
+            rtt_start = time.perf_counter()
+            cloud_resp = requests.post(
+                MODEL_SERVER_URL,
+                files={"image": ("frame.jpg", frame_bytes, "image/jpeg")},
+                timeout=5,
+            )
+            cloud_rtt_ms = (time.perf_counter() - rtt_start) * 1000
+
+            if cloud_resp.status_code == 200:
+                cloud_data = cloud_resp.json()
+                raw_detections = cloud_data.get("detections", [])
+                inference_ms = cloud_data.get("inference_time_ms", 0.0)
+            else:
+                app.logger.warning("Cloud Model Server trả mã lỗi %s: %s", cloud_resp.status_code, cloud_resp.text)
+                return jsonify({"error": f"Cloud Model Server error: {cloud_resp.text}"}), 502
+        except Exception as exc:
+            app.logger.warning("Không thể kết nối Cloud Model Server (%s): %s", MODEL_SERVER_URL, exc)
+            return jsonify({"error": f"Lỗi kết nối tới Cloud Model Server ({MODEL_SERVER_URL}): {exc}"}), 502
+    else:
+        if model is None:
+            return jsonify({"error": "Không tìm thấy model local và chưa cấu hình MODEL_SERVER_URL"}), 500
+        infer_started = time.perf_counter()
+        results = model.predict(
+            frame, imgsz=480, conf=0.12, iou=0.50, max_det=100, verbose=False
+        )
+        inference_ms = (time.perf_counter() - infer_started) * 1000
+
+        raw_detections = []
+        for result in results:
+            for box in result.boxes:
+                class_id = int(box.cls[0])
+                label = classNames.get(class_id, "Unknown")
+                if label == "Unknown":
+                    continue
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                raw_detections.append({
+                    "box": [x1, y1, x2, y2],
+                    "label": label,
+                    "class_id": class_id,
+                    "confidence": float(box.conf[0]),
+                })
 
     # The checkpoint has only mask-state classes, so its boxes serve as face proposals.
     deduplicated = suppress_duplicate_boxes(raw_detections)
@@ -422,7 +534,7 @@ def detect_frame():
     log_ids = []
     cloud_error = None
     upload_bytes = None
-    if log_candidates and BUCKET_NAME:
+    if log_candidates and (BUCKET_NAME or (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)):
         encoded_ok, encoded_frame = cv2.imencode(".jpg", frame)
         if encoded_ok:
             upload_bytes = encoded_frame.tobytes()
@@ -443,7 +555,7 @@ def detect_frame():
                         track_id=detection["track_id"],
                         image_url=None,
                         inference_time_ms=inference_ms,
-                        roundtrip_time_ms=None,
+                        roundtrip_time_ms=round(cloud_rtt_ms, 1) if cloud_rtt_ms is not None else None,
                         total_latency_ms=None,
                     )
                     db.session.add(entry)
@@ -458,12 +570,20 @@ def detect_frame():
                         "Stored result=%s track_id=%s confidence=%.3f",
                         canonical_status, detection["track_id"], detection["confidence"],
                     )
-                    if upload_bytes:
+                    if upload_bytes and BUCKET_NAME:
                         object_name = (
                             f"mask_logs/{datetime.now(VN_TZ):%Y%m%d_%H%M%S}_"
                             f"{canonical_status}_{uuid.uuid4().hex[:6]}.jpg"
                         )
                         upload_detection_image_async(entry.id, object_name, upload_bytes)
+
+                    if upload_bytes and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                        send_telegram_alert_async(
+                            status=canonical_status,
+                            confidence=f"{detection['confidence'] * 100:.0f}%",
+                            image_bytes=upload_bytes,
+                            track_id=detection["track_id"],
+                        )
         except Exception as exc:
             db.session.rollback()
             app.logger.exception("Could not save stable mask detections: %s", exc)
@@ -475,6 +595,7 @@ def detect_frame():
         "log_ids": log_ids,
         "log_id": log_ids[0] if log_ids else None,
         "inference_time_ms": round(inference_ms, 1),
+        "roundtrip_time_ms": round(cloud_rtt_ms, 1) if cloud_rtt_ms is not None else None,
         "server_processing_ms": round(processing_ms, 1),
         "frame_width": frame_width,
         "frame_height": frame_height,
