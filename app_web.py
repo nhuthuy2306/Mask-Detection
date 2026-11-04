@@ -6,6 +6,9 @@ import time
 import uuid
 import threading
 import logging
+import json
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 import pytz
 from datetime import datetime
 from dotenv import load_dotenv
@@ -25,6 +28,52 @@ VN_TZ = pytz.timezone('Asia/Ho_Chi_Minh')
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
 app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+if bool(TELEGRAM_BOT_TOKEN) != bool(TELEGRAM_CHAT_ID):
+    app.logger.warning("Telegram alerts are disabled: configure both Telegram settings.")
+
+
+def send_telegram_detection_async(log_id, status, confidence, track_id, created_at):
+    """Send a saved detection alert without delaying the webcam API response."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    status_names = {
+        "mask": "Đeo khẩu trang đúng",
+        "no_mask": "Không đeo khẩu trang",
+        "wrong_mask": "Đeo khẩu trang sai cách",
+    }
+    message = (
+        "🔔 Phát hiện mới\n"
+        f"Trạng thái: {status_names.get(status, status)}\n"
+        f"Độ tin cậy: {confidence}\n"
+        f"Mã theo dõi: {track_id if track_id is not None else 'N/A'}\n"
+        f"Thời gian: {created_at.strftime('%d/%m/%Y %H:%M:%S')}\n"
+        f"Mã log: {log_id}"
+    )
+
+    def send_task():
+        endpoint = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = json.dumps({"chat_id": TELEGRAM_CHAT_ID, "text": message}).encode("utf-8")
+        telegram_request = Request(
+            endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urlopen(telegram_request, timeout=8) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if not result.get("ok"):
+                app.logger.warning("Telegram rejected detection alert for log %s.", log_id)
+        except HTTPError as exc:
+            app.logger.warning("Telegram returned HTTP %s for log %s.", exc.code, log_id)
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
+            # Avoid logging exception text because it may include the tokenized URL.
+            app.logger.warning(
+                "Could not send Telegram alert for log %s (%s).", log_id, type(exc).__name__
+            )
+
+    threading.Thread(target=send_task, daemon=True).start()
 
 # --- CẤU HÌNH SUPABASE (POSTGRESQL) ---
 database_url = os.getenv("DATABASE_URL")
@@ -536,6 +585,10 @@ def detect_frame():
                     app.logger.info(
                         "Stored result=%s track_id=%s confidence=%.3f",
                         canonical_status, detection["track_id"], detection["confidence"],
+                    )
+                    send_telegram_detection_async(
+                        entry.id, canonical_status, entry.confidence,
+                        entry.track_id, entry.created_at,
                     )
                     if upload_bytes:
                         object_name = (
