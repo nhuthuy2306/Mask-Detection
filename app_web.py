@@ -867,7 +867,9 @@ def process_frame_tracks_and_logs(
         log_ids = []
         saved_events = []
         cloud_error = None
+        database_commit_ms = 0.0
         if selected:
+            database_started = time.perf_counter()
             try:
                 with app.app_context():
                     entries = []
@@ -896,6 +898,7 @@ def process_frame_tracks_and_logs(
                     ]
                     db.session.commit()
             except Exception as exc:
+                database_commit_ms = (time.perf_counter() - database_started) * 1000
                 db.session.rollback()
                 saved_events = []
                 log_ids = []
@@ -910,6 +913,7 @@ def process_frame_tracks_and_logs(
                 )
                 cloud_error = "Could not save stable detections to the database."
             else:
+                database_commit_ms = (time.perf_counter() - database_started) * 1000
                 with browser_track_lock:
                     for log_id, _, _, detection, track, _ in saved_events:
                         track["logged_label"] = detection["event_label"]
@@ -926,7 +930,7 @@ def process_frame_tracks_and_logs(
                         log_ids.append(log_id)
                 commit_camera_event_states(state_updates, now, saved_events)
 
-        return detections, saved_events, log_ids, cloud_error
+        return detections, saved_events, log_ids, cloud_error, database_commit_ms
 
 with app.app_context():
     db.create_all()
@@ -981,18 +985,26 @@ def index():
 def detect_frame():
     """Run mask detection on the latest laptop webcam frame."""
     request_started = time.perf_counter()
-    payload = request.get_json(silent=True) or {}
-    if not isinstance(payload, dict):
-        return jsonify({"error": "Body must be a JSON object"}), 400
-    image_data = payload.get("image", "")
-    client_session_id = payload.get("session_id")
+    request_parse_started = time.perf_counter()
+    legacy_json = request.mimetype != "image/jpeg"
+    if legacy_json:
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            return jsonify({"error": "Body must be a JSON object"}), 400
+        image_data = payload.get("image", "")
+        client_session_id = payload.get("session_id")
+        camera_scope_id = payload.get("camera_id")
+    else:
+        payload = None
+        image_data = None
+        client_session_id = request.args.get("session_id")
+        camera_scope_id = request.args.get("camera_id")
     if not isinstance(client_session_id, str) or not client_session_id or len(client_session_id) > 80:
         return jsonify({"error": "A valid webcam session_id is required"}), 400
     try:
         client_session_id = str(uuid.UUID(client_session_id))
     except (ValueError, AttributeError):
         return jsonify({"error": "A valid webcam session_id is required"}), 400
-    camera_scope_id = payload.get("camera_id")
     if camera_scope_id is not None:
         if not isinstance(camera_scope_id, str) or not camera_scope_id or len(camera_scope_id) > 80:
             return jsonify({"error": "A valid webcam camera_id is required"}), 400
@@ -1000,16 +1012,26 @@ def detect_frame():
             camera_scope_id = str(uuid.UUID(camera_scope_id))
         except (ValueError, AttributeError):
             return jsonify({"error": "A valid webcam camera_id is required"}), 400
-    if not isinstance(image_data, str) or not image_data.startswith("data:image/") or "," not in image_data:
-        return jsonify({"error": "A valid JPEG frame is required"}), 400
-
     import base64
     import numpy as np
 
+    payload_bytes = None
+    if legacy_json:
+        if not isinstance(image_data, str) or not image_data.startswith("data:image/") or "," not in image_data:
+            return jsonify({"error": "A valid JPEG frame is required"}), 400
+        try:
+            payload_bytes = base64.b64decode(image_data.split(",", 1)[1], validate=True)
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid image data"}), 400
+    else:
+        payload_bytes = request.get_data(cache=False, as_text=False)
+    request_parse_ms = (time.perf_counter() - request_parse_started) * 1000
+    if not payload_bytes:
+        return jsonify({"error": "A valid JPEG frame is required"}), 400
+
     decode_started = time.perf_counter()
     try:
-        frame_bytes = base64.b64decode(image_data.split(",", 1)[1], validate=True)
-        frame = cv2.imdecode(np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        frame = cv2.imdecode(np.frombuffer(payload_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             return jsonify({"error": "Could not decode the webcam frame"}), 400
     except (ValueError, TypeError):
@@ -1053,11 +1075,14 @@ def detect_frame():
     # The checkpoint has only mask-state classes, so its boxes serve as face proposals.
     deduplicated = suppress_duplicate_boxes(raw_detections)
     candidates = [item for item in deduplicated if item["confidence"] >= 0.12]
-    detections, saved_events, log_ids, cloud_error = process_frame_tracks_and_logs(
+    event_processing_started = time.perf_counter()
+    detections, saved_events, log_ids, cloud_error, database_commit_ms = process_frame_tracks_and_logs(
         candidates, track_state, client_session_id, camera_scope_id,
         frame_width, frame_height, inference_ms,
     )
+    event_processing_ms = (time.perf_counter() - event_processing_started) * 1000
 
+    event_image_started = time.perf_counter()
     full_frame_bytes = None
     if s3_client and saved_events:
         if not background_capacity_available():
@@ -1117,6 +1142,7 @@ def detect_frame():
                     "Could not enqueue S3 image for log %s (%s).",
                     log_id, type(exc).__name__,
                 )
+    event_image_prepare_ms = (time.perf_counter() - event_image_started) * 1000
 
     processing_ms = (time.perf_counter() - request_started) * 1000
     return jsonify({
@@ -1130,6 +1156,11 @@ def detect_frame():
         "inference_time_ms": round(inference_ms, 1),
         "server_processing_ms": round(processing_ms, 1),
         "decode_time_ms": round(decode_ms, 1),
+        "request_parse_time_ms": round(request_parse_ms, 1),
+        "frame_payload_bytes": len(payload_bytes),
+        "event_processing_time_ms": round(event_processing_ms, 1),
+        "database_commit_time_ms": round(database_commit_ms, 1),
+        "event_image_prepare_time_ms": round(event_image_prepare_ms, 1),
         **{key: round(value, 1) for key, value in inference_stages.items()},
         "frame_width": frame_width,
         "frame_height": frame_height,
@@ -1144,7 +1175,14 @@ def record_client_latency():
     if not isinstance(payload, dict):
         return jsonify({"error": "Body phải là JSON object"}), 400
     try:
-        log_id = int(payload.get('log_id'))
+        raw_log_ids = payload.get("log_ids")
+        if raw_log_ids is None:
+            raw_log_ids = [payload.get("log_id")]
+        if not isinstance(raw_log_ids, list) or not raw_log_ids or len(raw_log_ids) > MAX_DETECTIONS_PER_FRAME:
+            raise ValueError("invalid log IDs")
+        log_ids = list(dict.fromkeys(int(value) for value in raw_log_ids))
+        if any(log_id <= 0 for log_id in log_ids):
+            raise ValueError("invalid log IDs")
         roundtrip_ms = float(payload.get('roundtrip_time_ms'))
         total_ms = float(payload.get('total_latency_ms'))
         if (not math.isfinite(roundtrip_ms) or not math.isfinite(total_ms)
@@ -1154,24 +1192,26 @@ def record_client_latency():
         return jsonify({"error": "Số đo độ trễ không hợp lệ"}), 400
 
     try:
-        log_entry = db.session.get(DetectionLog, log_id)
+        log_entries = (DetectionLog.query
+                       .filter(DetectionLog.id.in_(log_ids)).all())
     except Exception as exc:
         db.session.rollback()
         app.logger.warning(
             "Could not read detection log for latency update (%s).", type(exc).__name__
         )
         return jsonify({"error": "Không kết nối được cơ sở dữ liệu để lưu độ trễ"}), 503
-    if log_entry is None:
+    if len(log_entries) != len(log_ids):
         return jsonify({"error": "Không tìm thấy log nhận diện"}), 404
     try:
-        log_entry.roundtrip_time_ms = roundtrip_ms
-        log_entry.total_latency_ms = total_ms
-        db.session.add(LatencySample(
-            detection_log_id=log_entry.id,
-            inference_time_ms=log_entry.inference_time_ms,
-            roundtrip_time_ms=roundtrip_ms,
-            total_latency_ms=total_ms,
-        ))
+        for log_entry in log_entries:
+            log_entry.roundtrip_time_ms = roundtrip_ms
+            log_entry.total_latency_ms = total_ms
+            db.session.add(LatencySample(
+                detection_log_id=log_entry.id,
+                inference_time_ms=log_entry.inference_time_ms,
+                roundtrip_time_ms=roundtrip_ms,
+                total_latency_ms=total_ms,
+            ))
         db.session.commit()
     except Exception as exc:
         db.session.rollback()
