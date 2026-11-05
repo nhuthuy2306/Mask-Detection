@@ -705,6 +705,19 @@
         let inferenceRetryAfter = 0;
         let cameraSession = 0;
         let webcamSessionId = null;
+        const webcamCameraId = (() => {
+            const storageKey = "mask-webcam-camera-scope";
+            try {
+                let cameraId = sessionStorage.getItem(storageKey);
+                if (!cameraId) {
+                    cameraId = crypto.randomUUID();
+                    sessionStorage.setItem(storageKey, cameraId);
+                }
+                return cameraId;
+            } catch (error) {
+                return crypto.randomUUID();
+            }
+        })();
         let overlayTracks = [];
         let nextTrackId = 1;
         let latencySamples = { infer: [], roundtrip: [], total: [] };
@@ -818,12 +831,16 @@
                 let match = null;
                 let bestDistance = maxDistance;
                 const trackingId = detection.tracking_id ?? detection.track_id;
+                const detectionSessionId = detection.session_id || webcamSessionId || "";
+                const trackIdentity = trackingId == null
+                    ? null : `${detectionSessionId}:${trackingId}`;
 
                 for (const track of overlayTracks) {
                     if (!unmatched.has(track.id)) continue;
                     if (trackingId != null
-                            ? track.trackIdentity !== trackingId
+                            ? track.trackIdentity !== trackIdentity
                             : track.label !== detection.label) continue;
+                    if (track.sessionId !== detectionSessionId) continue;
                     const previous = currentTrackBox(track, now);
                     const dx = centerX - (previous[0] + previous[2]) / 2;
                     const dy = centerY - (previous[1] + previous[3]) / 2;
@@ -841,8 +858,13 @@
                     match.lastSeen = now;
                     match.label = detection.label;
                     match.labelStable = detection.label_stable === true;
-                    match.trackIdentity = trackingId;
+                    match.trackIdentity = trackIdentity;
                     match.trackId = detection.track_id;
+                    match.sessionId = detectionSessionId;
+                    match.latestLogId = detection.latest_log_id ?? detection.log_id ?? null;
+                    match.eventLogStatus = detection.event_log_status ?? null;
+                    match.duplicateEvent = detection.duplicate_event ?? null;
+                    match.trackingStatus = detection.tracking_status ?? null;
                     match.confidence = detection.confidence;
                     match.frameWidth = frameWidth;
                     match.frameHeight = frameHeight;
@@ -851,8 +873,13 @@
                     overlayTracks.push({
                         id: nextTrackId++, label: detection.label,
                         labelStable: detection.label_stable === true,
-                        trackIdentity: trackingId,
+                        trackIdentity,
                         trackId: detection.track_id,
+                        sessionId: detectionSessionId,
+                        latestLogId: detection.latest_log_id ?? detection.log_id ?? null,
+                        eventLogStatus: detection.event_log_status ?? null,
+                        duplicateEvent: detection.duplicate_event ?? null,
+                        trackingStatus: detection.tracking_status ?? null,
                         fromBox: box, targetBox: box, transitionStarted: now,
                         lastSeen: now, confidence: detection.confidence,
                         frameWidth, frameHeight
@@ -896,11 +923,29 @@
                     : normalizedLabel === "wrong mask" ? "WRONG MASK"
                     : normalizedLabel === "mask" ? "MASK" : "ĐANG PHÂN LOẠI";
                 const confidenceText = `${(track.confidence * 100).toFixed(0)}%`;
-                const idPrefix = track.trackId == null ? "" : `ID ${track.trackId} · `;
-                const confirmationText = track.trackId == null
-                    ? " · CHỜ XÁC NHẬN"
-                    : track.labelStable ? "" : " · XÁC NHẬN";
-                const badgeText = `${idPrefix}${displayLabel} · ${confidenceText}${confirmationText}`;
+                const sessionPrefix = String(track.sessionId || "").slice(0, 4);
+                const trackText = track.trackId == null
+                    ? (track.trackingStatus === "capacity_full" ? "No track slot" : "Untracked")
+                    : `Track ${sessionPrefix}:${track.trackId}`;
+                let logText;
+                if (track.eventLogStatus === "duplicate_suppressed") {
+                    const prior = track.duplicateEvent || {};
+                    const priorTrack = prior.object_track_id == null
+                        ? "" : ` · ${String(prior.session_id || "").slice(0, 4)}:${prior.object_track_id}`;
+                    logText = prior.log_id == null
+                        ? "Duplicate suppressed"
+                        : `Duplicate of Log ${prior.log_id}${priorTrack}`;
+                } else if (track.eventLogStatus === "save_failed") {
+                    logText = track.latestLogId == null
+                        ? "Log save failed" : `Latest Log ${track.latestLogId} · new log failed`;
+                } else if (track.latestLogId != null) {
+                    logText = `Log ${track.latestLogId}`;
+                } else if (!track.labelStable) {
+                    logText = "Waiting for confirmation";
+                } else {
+                    logText = "No committed log";
+                }
+                const badgeText = `${trackText} · ${logText} · ${displayLabel} · ${confidenceText}`;
 
                 ctx.globalAlpha = alpha;
                 ctx.strokeStyle = color;
@@ -948,7 +993,9 @@
             try {
                 const response = await fetch("/api/detect", {
                     method: "POST", headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ image, session_id: webcamSessionId }), signal: controller.signal
+                    body: JSON.stringify({
+                        image, session_id: webcamSessionId, camera_id: webcamCameraId
+                    }), signal: controller.signal
                 });
                 if (response.status === 503) {
                     inferenceRetryAfter = performance.now() + 5000;

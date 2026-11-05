@@ -60,6 +60,10 @@ MAX_TRACKS_PER_SESSION = env_int(
 MAX_TRACK_OBSERVATIONS = env_int("MAX_TRACK_OBSERVATIONS", 6, 2, 16)
 TRACK_SESSION_TTL_SECONDS = env_float("TRACK_SESSION_TTL_SECONDS", 60, 10, 600)
 TRACK_EXPIRY_SECONDS = env_float("TRACK_EXPIRY_SECONDS", 3, 1, 10)
+CAMERA_EVENT_DEDUPE_TTL_SECONDS = env_float(
+    "CAMERA_EVENT_DEDUPE_TTL_SECONDS", 300, 30, 3600
+)
+MAX_CAMERA_EVENT_STATES = env_int("MAX_CAMERA_EVENT_STATES", 256, 64, 4096)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -318,6 +322,8 @@ if BUCKET_NAME:
 
 browser_track_sessions = {}
 browser_track_lock = threading.Lock()
+event_commit_lock = threading.RLock()
+camera_event_states = []
 background_executor = ThreadPoolExecutor(
     max_workers=BACKGROUND_WORKERS, thread_name_prefix="mask-background"
 )
@@ -341,6 +347,155 @@ def box_iou(box_a, box_b):
     area_b = max(0, box_b[2] - box_b[0]) * max(0, box_b[3] - box_b[1])
     union = area_a + area_b - intersection
     return intersection / union if union > 0 else 0.0
+
+
+def normalize_box(box, frame_width, frame_height):
+    return [
+        min(1.0, max(0.0, float(box[0]) / max(frame_width, 1))),
+        min(1.0, max(0.0, float(box[1]) / max(frame_height, 1))),
+        min(1.0, max(0.0, float(box[2]) / max(frame_width, 1))),
+        min(1.0, max(0.0, float(box[3]) / max(frame_height, 1))),
+    ]
+
+
+def camera_event_boxes_match(box_a, box_b):
+    """Match a recent event zone by geometry only; this is not person identity."""
+    overlap = box_iou(box_a, box_b)
+    center_a = ((box_a[0] + box_a[2]) / 2, (box_a[1] + box_a[3]) / 2)
+    center_b = ((box_b[0] + box_b[2]) / 2, (box_b[1] + box_b[3]) / 2)
+    distance = math.hypot(center_a[0] - center_b[0], center_a[1] - center_b[1])
+    diagonal_a = math.hypot(box_a[2] - box_a[0], box_a[3] - box_a[1])
+    diagonal_b = math.hypot(box_b[2] - box_b[0], box_b[3] - box_b[1])
+    area_a = max(1e-6, (box_a[2] - box_a[0]) * (box_a[3] - box_a[1]))
+    area_b = max(1e-6, (box_b[2] - box_b[0]) * (box_b[3] - box_b[1]))
+    area_similarity = min(area_a, area_b) / max(area_a, area_b)
+    return area_similarity >= 0.35 and (
+        overlap >= 0.18
+        or distance <= max(0.025, min(diagonal_a, diagonal_b) * 0.35)
+    )
+
+
+def prepare_camera_event_candidates(
+        log_candidates, camera_scope_id, frame_width, frame_height, now):
+    """Filter same-state events repeated by track resets or a webcam reconnect.
+
+    A camera scope is a per-tab random UUID persisted in sessionStorage. Matching
+    uses only recent box geometry and status, never face appearance or identity.
+    """
+    status_by_label = {
+        "mask": "mask",
+        "no mask": "no_mask",
+        "wrong mask": "wrong_mask",
+    }
+    global camera_event_states
+    camera_event_states = [
+        state for state in camera_event_states
+        if now - state["last_seen"] <= CAMERA_EVENT_DEDUPE_TTL_SECONDS
+    ]
+    selected = []
+    suppressed = []
+    state_updates = []
+    used_states = set()
+
+    for detection, track in log_candidates:
+        status = status_by_label[detection["event_label"]]
+        box = normalize_box(detection["box"], frame_width, frame_height)
+        matched_state = None
+        if camera_scope_id:
+            matches = [
+                state for state in camera_event_states
+                if state["camera_scope_id"] == camera_scope_id
+                and id(state) not in used_states
+                and camera_event_boxes_match(state["box"], box)
+            ]
+            if matches:
+                matched_state = min(
+                    matches,
+                    key=lambda state: math.hypot(
+                        (state["box"][0] + state["box"][2] - box[0] - box[2]) / 2,
+                        (state["box"][1] + state["box"][3] - box[1] - box[3]) / 2,
+                    ),
+                )
+                used_states.add(id(matched_state))
+
+        if matched_state is not None and matched_state["status"] == status:
+            # An earlier committed event already represents this active state.
+            matched_state["last_seen"] = now
+            matched_state["box"] = box
+            detection["duplicate_event"] = {
+                "log_id": matched_state.get("log_id"),
+                "session_id": matched_state.get("session_id"),
+                "object_track_id": matched_state.get("object_track_id"),
+            }
+            suppressed.append((detection, track))
+            continue
+
+        selected.append((detection, track, status))
+        if camera_scope_id:
+            state_updates.append((matched_state, camera_scope_id, status, box))
+
+    return selected, suppressed, state_updates
+
+
+def refresh_camera_event_states(detections, camera_scope_id, frame_width, frame_height, now):
+    """Refresh bounded event zones from confirmed visible detections each frame."""
+    if not camera_scope_id:
+        return
+    global camera_event_states
+    camera_event_states = [
+        state for state in camera_event_states
+        if now - state["last_seen"] <= CAMERA_EVENT_DEDUPE_TTL_SECONDS
+    ]
+    used_states = set()
+    for detection in detections:
+        if not detection.get("label_stable"):
+            continue
+        box = normalize_box(detection["box"], frame_width, frame_height)
+        matches = [
+            state for state in camera_event_states
+            if state["camera_scope_id"] == camera_scope_id
+            and id(state) not in used_states
+            and camera_event_boxes_match(state["box"], box)
+        ]
+        if not matches:
+            continue
+        matched_state = min(
+            matches,
+            key=lambda state: math.hypot(
+                (state["box"][0] + state["box"][2] - box[0] - box[2]) / 2,
+                (state["box"][1] + state["box"][3] - box[1] - box[3]) / 2,
+            ),
+        )
+        used_states.add(id(matched_state))
+        matched_state["last_seen"] = now
+        matched_state["box"] = box
+
+
+def commit_camera_event_states(state_updates, now, saved_events):
+    """Advance cross-session event state only after all corresponding logs commit."""
+    for state_update, saved_event in zip(state_updates, saved_events):
+        matched_state, camera_scope_id, status, box = state_update
+        log_id, _, _, _, track, _ = saved_event
+        event_reference = {
+            "log_id": log_id,
+            "session_id": track.get("session_id"),
+            "object_track_id": track["id"],
+        }
+        if matched_state is None:
+            camera_event_states.append({
+                "camera_scope_id": camera_scope_id,
+                "status": status,
+                "box": box,
+                "last_seen": now,
+                **event_reference,
+            })
+        else:
+            matched_state.update(
+                status=status, box=box, last_seen=now, **event_reference
+            )
+    if len(camera_event_states) > MAX_CAMERA_EVENT_STATES:
+        camera_event_states.sort(key=lambda state: state["last_seen"])
+        del camera_event_states[:len(camera_event_states) - MAX_CAMERA_EVENT_STATES]
 
 
 def class_aware_nms(boxes, class_ids, scores, score_threshold, iou_threshold, max_det):
@@ -491,14 +646,17 @@ def associate_and_stabilize(detections, now, track_state):
         diagonal = math.hypot(box[2] - box[0], box[3] - box[1])
         for track_id, track in tracks.items():
             elapsed = now - track["last_seen"]
-            if elapsed > 2.5:
+            if elapsed > TRACK_EXPIRY_SECONDS:
                 continue
             previous = track["box"]
             previous_x = (previous[0] + previous[2]) / 2
             previous_y = (previous[1] + previous[3]) / 2
-            distance = math.hypot(center_x - previous_x, center_y - previous_y)
+            prediction_time = min(elapsed, 0.75)
+            predicted_x = previous_x + track.get("velocity_x", 0.0) * prediction_time
+            predicted_y = previous_y + track.get("velocity_y", 0.0) * prediction_time
+            distance = math.hypot(center_x - predicted_x, center_y - predicted_y)
             reference_diagonal = min(diagonal, track["diagonal"])
-            max_distance = max(24, reference_diagonal * 0.45 + min(elapsed, 1.5) * 12)
+            max_distance = max(24, reference_diagonal * 0.50 + min(elapsed, 1.5) * 24)
             overlap = box_iou(box, previous)
             if overlap < 0.05 and distance > max_distance:
                 continue
@@ -506,15 +664,14 @@ def associate_and_stabilize(detections, now, track_state):
             previous_area = max(1, (previous[2] - previous[0]) * (previous[3] - previous[1]))
             area_similarity = min(current_area, previous_area) / max(current_area, previous_area)
             score = (
-                overlap * 0.65
-                + max(0.0, 1.0 - distance / max_distance) * 0.25
+                overlap * 0.60
+                + max(0.0, 1.0 - distance / max_distance) * 0.30
                 + area_similarity * 0.10
             )
             pair_scores.append((score, distance, detection_index, track_id))
 
     assignments = {}
     matched_track_ids = set()
-    created_track_ids = set()
     for _, _, detection_index, track_id in sorted(
             pair_scores, key=lambda pair: (-pair[0], pair[1], pair[2], pair[3])):
         if detection_index in assignments or track_id in matched_track_ids:
@@ -529,26 +686,19 @@ def associate_and_stabilize(detections, now, track_state):
         best_track = tracks.get(track_id) if track_id is not None else None
         if best_track is None:
             if len(tracks) >= MAX_TRACKS_PER_SESSION:
-                evictable = [
-                    key for key in tracks
-                    if key not in matched_track_ids and key not in created_track_ids
-                ]
-                if evictable:
-                    oldest_id = min(evictable, key=lambda key: tracks[key]["last_seen"])
-                    del tracks[oldest_id]
-                else:
-                    # Keep every model detection visible, but do not create a
-                    # transient identity that could produce duplicate events.
-                    outputs.append({
-                        "box": box,
-                        "label": detection["label"],
-                        "confidence": detection["confidence"],
-                        "track_id": None,
-                        "tracking_id": None,
-                        "label_stable": False,
-                        "tracking_status": "capacity_full",
-                    })
-                    continue
+                # Keep unmatched tracks through the occlusion grace period.
+                # New detections stay visible but do not evict a briefly hidden
+                # object or create an unstable temporary identity.
+                outputs.append({
+                    "box": box,
+                    "label": detection["label"],
+                    "confidence": detection["confidence"],
+                    "track_id": None,
+                    "tracking_id": None,
+                    "label_stable": False,
+                    "tracking_status": "capacity_full",
+                })
+                continue
             track_id = next_track_id
             next_track_id += 1
             best_track = {
@@ -556,6 +706,8 @@ def associate_and_stabilize(detections, now, track_state):
                 "box": box,
                 "diagonal": diagonal,
                 "last_seen": now,
+                "velocity_x": 0.0,
+                "velocity_y": 0.0,
                 "observations": [],
                 "candidate_label": None,
                 "candidate_since": now,
@@ -564,10 +716,26 @@ def associate_and_stabilize(detections, now, track_state):
                 "last_class_seen": 0.0,
                 "logged_label": None,
                 "pending_label": None,
+                "latest_log_id": None,
+                "event_log_status": None,
+                "duplicate_event": None,
             }
             tracks[track_id] = best_track
-            created_track_ids.add(track_id)
         else:
+            elapsed = max(1e-3, now - best_track["last_seen"])
+            old_x = (best_track["box"][0] + best_track["box"][2]) / 2
+            old_y = (best_track["box"][1] + best_track["box"][3]) / 2
+            current_x = (box[0] + box[2]) / 2
+            current_y = (box[1] + box[3]) / 2
+            speed_limit = max(30.0, best_track["diagonal"] * 0.8)
+            observed_vx = max(-speed_limit, min(speed_limit, (current_x - old_x) / elapsed))
+            observed_vy = max(-speed_limit, min(speed_limit, (current_y - old_y) / elapsed))
+            best_track["velocity_x"] = (
+                best_track.get("velocity_x", 0.0) * 0.65 + observed_vx * 0.35
+            )
+            best_track["velocity_y"] = (
+                best_track.get("velocity_y", 0.0) * 0.65 + observed_vy * 0.35
+            )
             best_track["box"] = box
             best_track["diagonal"] = diagonal
             best_track["last_seen"] = now
@@ -637,6 +805,10 @@ def associate_and_stabilize(detections, now, track_state):
             "track_id": track_id,
             "tracking_id": track_id,
             "label_stable": classification_is_stable,
+            "log_id": best_track.get("latest_log_id"),
+            "latest_log_id": best_track.get("latest_log_id"),
+            "event_log_status": best_track.get("event_log_status"),
+            "duplicate_event": best_track.get("duplicate_event"),
         }
         # Show the box as soon as YOLO detects the object; label confirmation
         # only gates logging, not whether the face is outlined on camera.
@@ -653,6 +825,108 @@ def associate_and_stabilize(detections, now, track_state):
 
     track_state["next_id"] = next_track_id
     return outputs, log_candidates
+
+
+def process_frame_tracks_and_logs(
+        candidates, track_state, session_id, camera_scope_id, frame_width,
+        frame_height, inference_ms):
+    """Serialize event decision, dedupe, commit, and in-memory acknowledgement."""
+    with event_commit_lock:
+        now = time.monotonic()
+        with browser_track_lock:
+            track_state["last_seen"] = now
+            detections, log_candidates = associate_and_stabilize(
+                candidates, now, track_state
+            )
+            for detection in detections:
+                detection["session_id"] = session_id
+                track = track_state["tracks"].get(detection["tracking_id"])
+                if track is not None:
+                    track["session_id"] = session_id
+                    detection["log_id"] = track.get("latest_log_id")
+                    detection["latest_log_id"] = track.get("latest_log_id")
+                    detection["event_log_status"] = track.get("event_log_status")
+                    detection["duplicate_event"] = track.get("duplicate_event")
+
+        refresh_camera_event_states(
+            detections, camera_scope_id, frame_width, frame_height, now
+        )
+        selected, suppressed, state_updates = prepare_camera_event_candidates(
+            log_candidates, camera_scope_id, frame_width, frame_height, now
+        )
+        with browser_track_lock:
+            for detection, track in suppressed:
+                # A matching event in the bounded camera ledger already has a
+                # committed database row, so this track can inherit that state.
+                track["logged_label"] = detection["event_label"]
+                track["pending_label"] = None
+                track["event_log_status"] = "duplicate_suppressed"
+                track["duplicate_event"] = detection.get("duplicate_event")
+                detection["event_log_status"] = "duplicate_suppressed"
+
+        log_ids = []
+        saved_events = []
+        cloud_error = None
+        if selected:
+            try:
+                with app.app_context():
+                    entries = []
+                    for detection, track, canonical_status in selected:
+                        entry = DetectionLog(
+                            status=canonical_status,
+                            confidence=f"{detection['confidence'] * 100:.0f}%",
+                            track_id=None,
+                            session_id=session_id,
+                            object_track_id=detection["tracking_id"],
+                            image_url=None,
+                            inference_time_ms=inference_ms,
+                            roundtrip_time_ms=None,
+                            total_latency_ms=None,
+                        )
+                        db.session.add(entry)
+                        entries.append((entry, detection, track, canonical_status))
+                    db.session.flush()
+                    for entry, _, _, _ in entries:
+                        # Keep the legacy column as the database log ID.
+                        entry.track_id = entry.id
+                    saved_events = [
+                        (entry.id, entry.confidence, entry.created_at, detection,
+                         track, canonical_status)
+                        for entry, detection, track, canonical_status in entries
+                    ]
+                    db.session.commit()
+            except Exception as exc:
+                db.session.rollback()
+                saved_events = []
+                log_ids = []
+                with browser_track_lock:
+                    for detection, track, _ in selected:
+                        if track["pending_label"] == detection["event_label"]:
+                            track["pending_label"] = None
+                        track["event_log_status"] = "save_failed"
+                        detection["event_log_status"] = "save_failed"
+                app.logger.warning(
+                    "Could not save stable mask detections (%s).", type(exc).__name__
+                )
+                cloud_error = "Could not save stable detections to the database."
+            else:
+                with browser_track_lock:
+                    for log_id, _, _, detection, track, _ in saved_events:
+                        track["logged_label"] = detection["event_label"]
+                        track["pending_label"] = None
+                        track["session_id"] = session_id
+                        track["latest_log_id"] = log_id
+                        track["event_log_status"] = "saved"
+                        track["duplicate_event"] = None
+                        detection["log_id"] = log_id
+                        detection["latest_log_id"] = log_id
+                        detection["event_log_status"] = "saved"
+                        detection["duplicate_event"] = None
+                        detection["event_log_id"] = log_id
+                        log_ids.append(log_id)
+                commit_camera_event_states(state_updates, now, saved_events)
+
+        return detections, saved_events, log_ids, cloud_error
 
 with app.app_context():
     db.create_all()
@@ -718,6 +992,14 @@ def detect_frame():
         client_session_id = str(uuid.UUID(client_session_id))
     except (ValueError, AttributeError):
         return jsonify({"error": "A valid webcam session_id is required"}), 400
+    camera_scope_id = payload.get("camera_id")
+    if camera_scope_id is not None:
+        if not isinstance(camera_scope_id, str) or not camera_scope_id or len(camera_scope_id) > 80:
+            return jsonify({"error": "A valid webcam camera_id is required"}), 400
+        try:
+            camera_scope_id = str(uuid.UUID(camera_scope_id))
+        except (ValueError, AttributeError):
+            return jsonify({"error": "A valid webcam camera_id is required"}), 400
     if not isinstance(image_data, str) or not image_data.startswith("data:image/") or "," not in image_data:
         return jsonify({"error": "A valid JPEG frame is required"}), 400
 
@@ -771,125 +1053,70 @@ def detect_frame():
     # The checkpoint has only mask-state classes, so its boxes serve as face proposals.
     deduplicated = suppress_duplicate_boxes(raw_detections)
     candidates = [item for item in deduplicated if item["confidence"] >= 0.12]
-    with browser_track_lock:
-        now = time.monotonic()
-        track_state["last_seen"] = now
-        detections, log_candidates = associate_and_stabilize(candidates, now, track_state)
+    detections, saved_events, log_ids, cloud_error = process_frame_tracks_and_logs(
+        candidates, track_state, client_session_id, camera_scope_id,
+        frame_width, frame_height, inference_ms,
+    )
 
-    log_ids = []
-    cloud_error = None
-    saved_events = []
-    if log_candidates:
-        try:
-            with app.app_context():
-                entries = []
-                for detection, track in log_candidates:
-                    canonical_status = {
-                        "mask": "mask",
-                        "no mask": "no_mask",
-                        "wrong mask": "wrong_mask",
-                    }[detection["event_label"]]
-                    entry = DetectionLog(
-                        status=canonical_status,
-                        confidence=f"{detection['confidence'] * 100:.0f}%",
-                        track_id=None,
-                        session_id=client_session_id,
-                        object_track_id=detection["tracking_id"],
-                        image_url=None,
-                        inference_time_ms=inference_ms,
-                        roundtrip_time_ms=None,
-                        total_latency_ms=None,
-                    )
-                    db.session.add(entry)
-                    entries.append((entry, detection, track, canonical_status))
-                db.session.flush()
-                for entry, _, _, _ in entries:
-                    # Preserve the legacy column as the log ID; object_track_id stores
-                    # the session-scoped identity of the detected object.
-                    entry.track_id = entry.id
-                saved_events = [
-                    (entry.id, entry.confidence, entry.created_at, detection,
-                     track, canonical_status)
-                    for entry, detection, track, canonical_status in entries
-                ]
-                db.session.commit()
-        except Exception as exc:
-            db.session.rollback()
-            with browser_track_lock:
-                for _, track in log_candidates:
-                    track["pending_label"] = None
+    full_frame_bytes = None
+    if s3_client and saved_events:
+        if not background_capacity_available():
             app.logger.warning(
-                "Could not save stable mask detections (%s).", type(exc).__name__
+                "S3 queue is full; skipped image uploads. Database detection logs are saved."
             )
-            cloud_error = "Could not save stable detections to the database."
         else:
-            # Commit the event reservation immediately after the DB transaction.
-            # Side effects below are optional and cannot cause the log to repeat.
-            with browser_track_lock:
-                for log_id, confidence, created_at, detection, track, _ in saved_events:
-                    track["logged_label"] = detection["event_label"]
-                    track["pending_label"] = None
-                    detection["log_id"] = log_id
-                    log_ids.append(log_id)
-
-            full_frame_bytes = None
-            if s3_client and saved_events:
-                if not background_capacity_available():
-                    app.logger.warning(
-                        "S3 queue is full; skipped image uploads. Database detection logs are saved."
-                    )
+            try:
+                encoded_ok, encoded_frame = cv2.imencode(".jpg", frame)
+                if encoded_ok:
+                    full_frame_bytes = encoded_frame.tobytes()
                 else:
-                    try:
-                        encoded_ok, encoded_frame = cv2.imencode(".jpg", frame)
-                        if encoded_ok:
-                            full_frame_bytes = encoded_frame.tobytes()
-                        else:
-                            app.logger.warning("Could not JPEG-encode the event frame for S3.")
-                    except Exception as exc:
-                        app.logger.warning("Could not prepare event frame for S3 (%s).", type(exc).__name__)
+                    app.logger.warning("Could not JPEG-encode the event frame for S3.")
+            except Exception as exc:
+                app.logger.warning("Could not prepare event frame for S3 (%s).", type(exc).__name__)
 
-            for log_id, confidence, created_at, detection, _, canonical_status in saved_events:
-                app.logger.info(
-                    "Stored result=%s log_id=%s track_id=%s confidence=%.3f",
-                    canonical_status, log_id, detection["tracking_id"], detection["confidence"],
+    for log_id, confidence, created_at, detection, _, canonical_status in saved_events:
+        app.logger.info(
+            "Stored result=%s log_id=%s session_id=%s track_id=%s confidence=%.3f",
+            canonical_status, log_id, client_session_id,
+            detection["tracking_id"], detection["confidence"],
+        )
+        telegram_image = None
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            try:
+                telegram_image = encode_detection_crop(frame, detection["box"])
+            except Exception as exc:
+                app.logger.warning(
+                    "Could not crop Telegram image for log %s (%s).",
+                    log_id, type(exc).__name__,
                 )
-                telegram_image = None
-                if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                    try:
-                        telegram_image = encode_detection_crop(frame, detection["box"])
-                    except Exception as exc:
-                        app.logger.warning(
-                            "Could not crop Telegram image for log %s (%s).",
-                            log_id, type(exc).__name__,
-                        )
-                    if telegram_image is None:
-                        app.logger.warning("No image crop available for Telegram log %s.", log_id)
-                    try:
-                        send_telegram_detection_async(
-                            log_id, canonical_status, confidence,
-                            detection["tracking_id"], created_at, telegram_image,
-                            session_id=client_session_id,
-                        )
-                    except Exception as exc:
-                        app.logger.warning(
-                            "Could not enqueue Telegram alert for log %s (%s).",
-                            log_id, type(exc).__name__,
-                        )
-            # Reserve available queue slots for per-object Telegram alerts first;
-            # optional S3 copies use only the remaining capacity.
-            if full_frame_bytes:
-                for log_id, _, _, _, _, canonical_status in saved_events:
-                    object_name = (
-                        f"mask_logs/{datetime.now(VN_TZ):%Y%m%d_%H%M%S}_"
-                        f"{canonical_status}_{uuid.uuid4().hex[:6]}.jpg"
-                    )
-                    try:
-                        upload_detection_image_async(log_id, object_name, full_frame_bytes)
-                    except Exception as exc:
-                        app.logger.warning(
-                            "Could not enqueue S3 image for log %s (%s).",
-                            log_id, type(exc).__name__,
-                        )
+            if telegram_image is None:
+                app.logger.warning("No image crop available for Telegram log %s.", log_id)
+            try:
+                send_telegram_detection_async(
+                    log_id, canonical_status, confidence,
+                    detection["tracking_id"], created_at, telegram_image,
+                    session_id=client_session_id,
+                )
+            except Exception as exc:
+                app.logger.warning(
+                    "Could not enqueue Telegram alert for log %s (%s).",
+                    log_id, type(exc).__name__,
+                )
+    # Reserve available queue slots for per-object Telegram alerts first;
+    # optional S3 copies use only the remaining capacity.
+    if full_frame_bytes:
+        for log_id, _, _, _, _, canonical_status in saved_events:
+            object_name = (
+                f"mask_logs/{datetime.now(VN_TZ):%Y%m%d_%H%M%S}_"
+                f"{canonical_status}_{uuid.uuid4().hex[:6]}.jpg"
+            )
+            try:
+                upload_detection_image_async(log_id, object_name, full_frame_bytes)
+            except Exception as exc:
+                app.logger.warning(
+                    "Could not enqueue S3 image for log %s (%s).",
+                    log_id, type(exc).__name__,
+                )
 
     processing_ms = (time.perf_counter() - request_started) * 1000
     return jsonify({
@@ -1022,16 +1249,19 @@ def get_latency_stats():
 
 @app.route('/api/logs/clear', methods=['GET', 'POST'])
 def clear_logs():
-    with browser_track_lock:
-        browser_track_sessions.clear()
-    try:
-        db.session.query(LatencySample).delete()
-        num_rows_deleted = db.session.query(DetectionLog).delete()
-        db.session.commit()
-        return jsonify({"status": "success", "message": f"Đã xóa {num_rows_deleted} record trong DB"})
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"status": "error", "message": str(e)}), 500
+    with event_commit_lock:
+        try:
+            db.session.query(LatencySample).delete()
+            num_rows_deleted = db.session.query(DetectionLog).delete()
+            db.session.commit()
+            with browser_track_lock:
+                browser_track_sessions.clear()
+            camera_event_states.clear()
+            return jsonify({"status": "success", "message": f"Đã xóa {num_rows_deleted} record trong DB"})
+        except Exception as exc:
+            db.session.rollback()
+            app.logger.warning("Could not clear detection logs (%s).", type(exc).__name__)
+            return jsonify({"status": "error", "message": "Could not clear detection logs."}), 500
 
 
 if __name__ == '__main__':
