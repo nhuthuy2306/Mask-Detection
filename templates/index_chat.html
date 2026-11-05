@@ -562,6 +562,11 @@
                             </span>
                         </button>
 
+                        <div class="flex items-center gap-2 text-xs text-slate-400" aria-live="polite">
+                            <span id="inference-status-dot" class="h-2 w-2 rounded-full bg-slate-500"></span>
+                            <span id="inference-status">Chưa bắt đầu phân loại</span>
+                        </div>
+
                     </div>
 
                 </div>
@@ -697,7 +702,9 @@
         let renderFrameId = null;
         let inferenceController = null;
         let inferenceBusy = false;
+        let inferenceRetryAfter = 0;
         let cameraSession = 0;
+        let webcamSessionId = null;
         let overlayTracks = [];
         let nextTrackId = 1;
         let latencySamples = { infer: [], roundtrip: [], total: [] };
@@ -729,6 +736,8 @@
                 document.getElementById("placeholder-text").classList.remove("hidden");
                 button.disabled = false;
                 setCameraConnected(false);
+                webcamSessionId = null;
+                setInferenceStatus("Đã dừng phân loại", false);
                 return;
             }
             if (!navigator.mediaDevices?.getUserMedia) {
@@ -751,6 +760,7 @@
                 button.disabled = false;
                 document.getElementById("connect-text").innerText = "Tắt webcam";
                 cameraSession++;
+                webcamSessionId = crypto.randomUUID();
                 startDetection(cameraSession);
             } catch (error) {
                 cameraStream = null;
@@ -770,11 +780,21 @@
             document.getElementById(`lat-${stem}-max`).innerText = Math.max(...samples).toFixed(1);
         }
 
+        function setInferenceStatus(message, busy) {
+            const label = document.getElementById("inference-status");
+            const dot = document.getElementById("inference-status-dot");
+            if (!label || !dot) return;
+            label.textContent = message;
+            dot.className = `h-2 w-2 rounded-full ${busy ? "bg-amber-400 animate-pulse" : "bg-emerald-500"}`;
+        }
+
         function startDetection(sessionId) {
             renderDetectionOverlay(sessionId);
             inferLatestFrame(sessionId);
             inferenceTimer = setInterval(() => {
-                if (!inferenceBusy) inferLatestFrame(sessionId);
+                if (!inferenceBusy && performance.now() >= inferenceRetryAfter) {
+                    inferLatestFrame(sessionId);
+                }
             }, INFERENCE_INTERVAL_MS);
         }
 
@@ -909,10 +929,10 @@
             if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth) return;
 
             inferenceBusy = true;
+            setInferenceStatus("Đang gửi frame và phân loại…", true);
             const capture = document.createElement("canvas");
-            const scale = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
-            capture.width = Math.round(video.videoWidth * scale);
-            capture.height = Math.round(video.videoHeight * scale);
+            capture.width = video.videoWidth;
+            capture.height = video.videoHeight;
             const captureContext = capture.getContext("2d");
             captureContext.save();
             captureContext.translate(capture.width, 0);
@@ -928,9 +948,20 @@
             try {
                 const response = await fetch("/api/detect", {
                     method: "POST", headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ image }), signal: controller.signal
+                    body: JSON.stringify({ image, session_id: webcamSessionId }), signal: controller.signal
                 });
+                if (response.status === 503) {
+                    inferenceRetryAfter = performance.now() + 5000;
+                    setInferenceStatus("Máy chủ đủ phiên webcam · thử lại sau 5 giây", false);
+                    return;
+                }
+                if (response.status === 413) {
+                    inferenceRetryAfter = performance.now() + 5000;
+                    setInferenceStatus("Frame vượt giới hạn tải lên · kiểm tra MAX_FRAME_REQUEST_MB", false);
+                    return;
+                }
                 if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                inferenceRetryAfter = 0;
                 const result = await response.json();
                 if (sessionId !== cameraSession) return;
                 if (result.cloud_error) console.warn(result.cloud_error);
@@ -941,6 +972,12 @@
                 showLiveMetric("infer", latencySamples.infer, result.inference_time_ms);
                 showLiveMetric("roundtrip", latencySamples.roundtrip, roundtrip);
                 showLiveMetric("total", latencySamples.total, frameAge);
+                setInferenceStatus(
+                    `Phản hồi ${result.server_processing_ms} ms · model ${result.inference_time_ms} ms` +
+                    (result.untracked_detection_count
+                        ? ` · ${result.untracked_detection_count} đối tượng chưa có track (đã đủ giới hạn)`
+                        : ""), false
+                );
 
                 updateOverlayTracks(result.detections, capture.width, capture.height, responseReceivedAt);
 
@@ -960,6 +997,7 @@
             } catch (error) {
                 if (error.name !== "AbortError") {
                     console.error("Frame inference failed:", error);
+                    setInferenceStatus("Lỗi kết nối khi phân loại", false);
                     setCameraConnected(false);
                 }
             } finally {
@@ -1252,9 +1290,14 @@
             pageLogs.forEach(log => {
                 const info = getStatusInfo(log.status);
                 const confidence = parseConfidence(log.confidence);
-                const trackBadge = log.track_id != null && Number.isFinite(Number(log.track_id))
-                    ? `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-white/5 text-slate-400">ID ${escapeHtml(log.track_id)}</span>`
-                    : "";
+                const logBadge = [
+                    log.id != null && Number.isFinite(Number(log.id))
+                        ? `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-white/5 text-slate-400">Log ${escapeHtml(log.id)}</span>`
+                        : "",
+                    log.object_track_id != null
+                        ? `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-white/5 text-slate-400">Track ${escapeHtml(String(log.session_id || "").slice(0, 4))}:${escapeHtml(log.object_track_id)}</span>`
+                        : ""
+                ].join("");
                 const logEl = document.createElement("div");
                 logEl.className = `group p-3 rounded-xl border ${info.classes} transition hover:bg-white/[0.04]`;
                 logEl.innerHTML = `
@@ -1264,7 +1307,7 @@
                             <div class="flex items-center justify-between gap-2">
                                 <div class="flex items-center gap-2 min-w-0">
                                     <span class="font-medium text-sm truncate">${escapeHtml(info.label)}</span>
-                                    ${trackBadge}
+                                    ${logBadge}
                                 </div>
                                 <span class="text-xs text-slate-500 shrink-0">${escapeHtml(log.time || "--:--:--")}</span>
                             </div>
